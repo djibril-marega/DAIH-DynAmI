@@ -81,7 +81,7 @@ class Agent_DAIH():
     # Continuous variational free energy
     def free_energy(self, state_prior, state_posterior, D_poresterior, pi_prior, actual, pi_obs, gamma_obs, prediction):
         def complexity(state_posterior, state_prior, gamma_obs, pi_prior):
-            return torch.sum(0.5*pi_prior*((state_posterior-D_poresterior-state_prior) ** 2)) - \
+            return torch.sum(0.5*pi_prior*((state_posterior+D_poresterior-state_prior) ** 2)) - \
             torch.sum(0.5*gamma_obs) - torch.sum(0.5*torch.log(pi_prior))
         
         def accuracy(actual, pi_obs, prediction):
