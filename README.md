@@ -4,7 +4,7 @@
 
 DAIH-DynAmI is an experimental hybrid active inference framework. It aims to combine continuous belief updating, prediction of action consequences, amortized policy generation, and reflex motor control. Its guiding principle is to find an action that is sufficiently consistent with the internal model within a limited computational budget, rather than exhaustively exploring every possible policy.
 
-> **Project status:** prototype under development. This README distinguishes the intended theoretical principles, the mechanisms visible in the supplied code, and possible future developments. It does not claim that every theoretical mechanism has already been fully implemented.
+>**Project status:** implemented prototype under testing and validation. The core architecture and intended mechanisms are present in the codebase. The project is currently undergoing testing, debugging, and validation to verify that the implementation behaves as expected and remains consistent with the theoretical framework. Further refinements may be introduced as testing progresses.
 
 ## Table of Contents
 
