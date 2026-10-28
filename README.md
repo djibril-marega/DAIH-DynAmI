@@ -55,38 +55,41 @@ Actions and observations are declared as groups, but their individual elements b
 
 A state can be represented by several derivative orders:
 
-\[
+$$
 \tilde{\mu} =
 \begin{bmatrix}
-\mu^{(0)}\\
-\mu^{(1)}\\
-\vdots\\
+\mu^{(0)} \\
+\mu^{(1)} \\
+\vdots \\
 \mu^{(n)}
 \end{bmatrix}
-\]
+$$
 
 The conceptual dynamics of a generalized coordinate are:
 
-\[
+$$
 \mu^{(i)}_{t+\Delta t}
-\approx \mu^{(i)}_t +
-\left(D\mu^{(i)}_t -
-\frac{\partial F}{\partial \mu^{(i)}_t}\right)\Delta t
-\]
+\approx
+\mu^{(i)}_t +
+\left(
+D\mu^{(i)}_t -
+\frac{\partial F}{\partial \mu^{(i)}_t}
+\right)\Delta t
+$$
 
-where \(D\mu^{(i)}\) denotes the next derivative order. The final order is closed by setting its next derivative to zero. This expression describes the intended principle; the exact tensor shapes and their interpretation must remain consistent across the functions that prepare inputs, calculate \(F\), and perform updates.
+where $D\mu^{(i)}$ denotes the next derivative order. The final order is closed by setting its next derivative to zero. This expression describes the intended principle; the exact tensor shapes and their interpretation must remain consistent across the functions that prepare inputs, calculate $F$, and perform updates.
 
 For a state with three orders, for example, the temporal error term can be written as:
 
-\[
+$$
 \begin{bmatrix}
-\dot{\mu}_0-x_1-\mu_1\\
-\dot{\mu}_1-x_2-\mu_2\\
-\dot{\mu}_2-x_3
+\dot{\mu}_0 - x_1 - \mu_1 \\
+\dot{\mu}_1 - x_2 - \mu_2 \\
+\dot{\mu}_2 - x_3
 \end{bmatrix}
-\]
+$$
 
-where the \(x_i\) represent the prior outputs of the transition function `f`, according to the model's convention.
+where the $x_i$ represent the prior outputs of the transition function `f`, according to the model's convention.
 
 ## Software Architecture
 
@@ -137,9 +140,13 @@ In the supplied code, `inference(observations)` first runs `beliefs_update(obser
 
 ## Inference and Belief Updating
 
-### Variational free energy \(F\)
+### Variational free energy $F$
 
-Variational free energy combines a complexity term related to prior beliefs and an accuracy term related to observations. In the supplied code, the calculation is organized around:
+Variational free energy combines a complexity term related to prior beliefs and an accuracy term related to observations. The conceptual formulation used by this project is:
+
+$$F(\tilde{\mu}) = \left[\frac{1}{2}\left(\dot{\tilde{\mu}} - D\tilde{\mu} - \tilde{\mu}_{\text{prior}}\right)^2\Pi_{\text{prior}} - \frac{1}{2}\ln|\Pi_{\text{obs}}| - \frac{1}{2}\ln|\Pi_{\text{prior}}|\right] - \left[-\frac{1}{2}\left(\tilde{y} - g(\tilde{\mu})\right)^2\Pi_{\text{obs}}\right]$$
+
+In the supplied code, the calculation is organized as follows:
 
 ```python
 def free_energy(
@@ -168,15 +175,15 @@ def free_energy(
 
 The main symbols are:
 
-- \(\mu\): belief or estimated state;
-- \(D\mu\): next generalized derivative;
-- \(\mu_{\text{prior}}\): prior prediction from the dynamics;
-- \(\Pi_{\text{prior}}\): precision of prior beliefs;
-- \(y\): available observation;
-- \(g(\mu)\): predicted observation;
-- \(\Pi_{\text{obs}}\): observation precision.
+- $\tilde{\mu}$: generalized belief or estimated state;
+- $D\tilde{\mu}$: next generalized derivative;
+- $\tilde{\mu}_{\text{prior}}$: prior prediction from the dynamics;
+- $\Pi_{\text{prior}}$: precision of prior beliefs;
+- $\tilde{y}$: available observation (`actual`);
+- $g(\tilde{\mu})$: predicted observation (`prediction`);
+- $\Pi_{\text{obs}}$: observation precision.
 
-The reference mathematical formula and the Python function should be considered together: sign conventions, normalization constants, and argument names should be checked as the model evolves.
+The reference mathematical formula and the Python function should be considered together. Their sign conventions, normalization constants, tensor shapes, and argument names must remain consistent as the model evolves.
 
 ### Belief updating
 
@@ -197,9 +204,9 @@ The inputs used by the generative functions are then resynchronized with the upd
 
 The model uses PyTorch `Normal` or `MultivariateNormal` distributions, depending on the shape of the initial parameters. Prior precisions can be initialized from variances:
 
-\[
+$$
 \Pi_{\text{prior}} = \frac{1}{\sigma^2}
-\]
+$$
 
 A high precision corresponds to lower uncertainty. Multivariate covariance matrices must have valid shapes, be symmetric, and be positive definite.
 
@@ -207,53 +214,53 @@ A high precision corresponds to lower uncertainty. Multivariate covariance matri
 
 ### Expected free energy \(G\)
 
-Action selection uses **Expected Free Energy** (\(G\)) to estimate the consequences of a policy. The conceptual formulation provided by this project is:
+Action selection uses **Expected Free Energy** ($G$) to estimate the consequences of a policy. The conceptual formulation provided by this project is:
 
-\[
-G(\pi)=
+$$
+G(\pi) =
 \frac{1}{2}\ln(2\pi e)
 -\frac{1}{2}\ln(\Pi_{\text{prior}})
 -\frac{1}{2}\ln(2\pi e\,\Sigma^2)
--V(f(\mu_{\text{prior}}))
-\]
+-V\left(f(\mu)\right)
+$$
 
 This expression should be interpreted according to the precision, variance, and transition-cost conventions adopted by the model. The current code calculates the score using `execepted_free_energy(...)`, separating an ambiguity term from a transition-risk/cost term. The term-by-term correspondence with the theoretical equation should be verified as the project evolves.
 
-### Amortized policy generation \(P\)
+### Amortized policy generation $P$
 
-The theoretical architecture proposes that one or more \(P\) functions quickly generate a candidate policy and its expected score:
+The theoretical architecture proposes that one or more $P$ functions quickly generate a candidate policy and its expected score:
 
-\[
-P_t(S_t,\Pi_{\text{prior}},\epsilon)
-\longrightarrow (\pi,G_{\text{prior}})
-\]
+$$
+P_t(S_t, \Pi_{\text{prior}}, \epsilon)
+\longrightarrow (\pi, G_{\text{prior}})
+$$
 
 where:
 
-- \(S_t\) represents the relevant internal state;
-- \(\Pi_{\text{prior}}\) represents the associated precisions;
-- \(\epsilon\) represents the prediction error used to adapt generation;
-- \(\pi\) is the candidate policy;
-- \(G_{\text{prior}}\) is its expected score.
+- $S_t$ represents the relevant internal state;
+- $\Pi_{\text{prior}}$ represents the associated precisions;
+- $\epsilon$ represents the prediction error used to adapt generation;
+- $\pi$ is the candidate policy;
+- $G_{\text{prior}}$ is its expected score.
 
 Policy length may depend on precision or uncertainty: when confidence decreases, the agent should favor a shorter, more cautious horizon. This relationship is an architectural objective; its exact behavior depends on the implementation of the `p` functions and the candidate generator.
 
 ### Tolerance loop
 
-The `policy_selection()` method retrieves candidates through `model_components.get_policy_candidates(...)`, simulates actions in local copies of beliefs and inputs, and then calculates a reevaluated score \(G_{\text{posterior}}\).
+The `policy_selection()` method retrieves candidates through `model_components.get_policy_candidates(...)`, simulates actions in local copies of beliefs and inputs, and then calculates a reevaluated score $G_{\text{posterior}}$.
 
 The error described by the model is:
 
-\[
+$$
 \epsilon = \Pi_P
-\left(G_{\text{prior}}-G_{\text{posterior}}\right)^2
-\]
+\left(G_{\text{prior}} - G_{\text{posterior}}\right)^2
+$$
 
 The theoretical tolerance rule is:
 
-- if \(\epsilon \leq 1\), the candidate is considered consistent with the prediction;
+- if $\epsilon \leq 1$, the candidate is considered consistent with the prediction;
 - otherwise, the candidate is rejected and the error is fed back into the generator inputs to encourage another proposal;
-- precision \(\Pi_P\) is adjusted to change tolerance and, eventually, the planning horizon.
+- precision $\Pi_P$ is adjusted to change tolerance and, eventually, the planning horizon.
 
 In the current code, `policy_selection()` implements a threshold comparison, an update to `pi_p`, and a selection among accepted candidates.
 
@@ -262,7 +269,7 @@ In the current code, `policy_selection()` implements a threshold comparison, an 
 The proposed architecture distinguishes two modes:
 
 - **Wakefulness:** locally adjust the policy generator to reduce the gap between the predicted score and the reevaluated score.
-- **Rest / sleep:** replay past trajectories and train the generative functions using a global loss based on \(F\).
+- **Rest / sleep:** replay past trajectories and train the generative functions using a global loss based on $F$.
 
 This separation is an architectural proposal. The supplied main code does not, by itself, show a complete sleep or trajectory-replay loop.
 
