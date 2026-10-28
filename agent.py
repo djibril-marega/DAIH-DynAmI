@@ -69,11 +69,6 @@ class Agent_DAIH():
 
 
 
-    def state_precision_update(self, F, state_prior, state_posterior, pi_prior, actual, pi_obs, predictions, order=2, argnums=0):
-        dF = utils.derivative_x(F, order, argnums)
-        return dF(state_prior, state_posterior, pi_prior, actual, pi_obs, predictions)
-
-
 
     def inference(self, observations):
         for motors in self.beliefs_update(observations):
@@ -99,7 +94,6 @@ class Agent_DAIH():
         layers_list = self.navigator.layers()
         for layer in layers_list:
             states_of_layer = self.navigator.states_by_layer(layer)
-            #print(f"states of the layer {layer}: ", states_of_layer)
             F_layer_list = []
             pi_priors_list = []
             for state_name in states_of_layer:
@@ -184,7 +178,6 @@ class Agent_DAIH():
             policies_candidats = model_components.get_policy_candidates(self.navigator, self.functions_map, self.inputs_map)
             admited_candidats = []
             is_policy_finded = False
-            globol_error_eps = torch.tensor(0, dtype=torch.float32)
             for state_name, policy in policies_candidats.items():
                 local_Q_ = copy.deepcopy(self.Q_)
                 local_inputs_map = copy.deepcopy(self.inputs_map)
@@ -221,12 +214,12 @@ class Agent_DAIH():
                 try:
                     pi_p = self.pi_p[state_name].requires_grad_(True)
                     error_eps = inference.policy_error(G_prior, G_posterior, pi_p)
-                    globol_error_eps = torch.clamp(globol_error_eps + error_eps, max=1e+7)
 
                     if error_eps <= 1:
                         fist_action = policy[0][0]
-                        
                         admited_candidats.append([fist_action, G_posterior])
+                    else: 
+                        self.inputs_map[f"error_{state_name}"] = error_eps.detach()
                 except UnboundLocalError:
                     pass
 
@@ -240,16 +233,13 @@ class Agent_DAIH():
 
             # Sort the best policy candidat or update error_eps
             if admited_candidats:
-                best_candidat = max(admited_candidats, key=lambda x: x[1])
-                is_policy_finded = True
-            else:
-                self.inputs_map[f"error_{state_name}"] = globol_error_eps.detach()
+                best_candidat = min(admited_candidats, key=lambda x: x[1])
+                is_policy_finded = True 
 
             # Update the new action and init error for next time step
             if is_policy_finded:
                 action_group, new_action_oh = inference.update_current_action(best_candidat, self.actions_id, self.navigator)
                 self.inputs_map[action_group[0]] = new_action_oh
-                print("self.pi: ", self.pi_p[state_name].detach())
                 self.inputs_map[f"error_{state_name}"] = self.pi_p[state_name].detach()
                 
                 return  {"action": action_name,

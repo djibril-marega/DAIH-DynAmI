@@ -227,7 +227,7 @@ def jacobian_from_output(f_out, mu, Pi_bruit=None, eps=1e-6):
 
 
 def policy_error(G_prior, G_posterior, pi_p):
-    return (1/pi_p)*((G_prior - G_posterior) ** 2)
+    return torch.clamp(pi_p*((G_prior - G_posterior) ** 2), max=1e+9)
 
 
 def update_current_action(best_candidat, actions_id, navigator):
