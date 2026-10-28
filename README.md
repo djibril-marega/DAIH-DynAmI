@@ -83,8 +83,8 @@ For a state with three orders, for example, the temporal error term can be writt
 
 $$
 \begin{bmatrix}
-\dot{\mu}_0 - x_1 - \mu_1 \\
-\dot{\mu}_1 - x_2 - \mu_2 \\
+\dot{\mu}_0 + \mu_1 - x_1 \\
+\dot{\mu}_1 + \mu_2 - x_2 \\
 \dot{\mu}_2 - x_3
 \end{bmatrix}
 $$
@@ -144,7 +144,7 @@ In the supplied code, `inference(observations)` first runs `beliefs_update(obser
 
 Variational free energy combines a complexity term related to prior beliefs and an accuracy term related to observations. The conceptual formulation used by this project is:
 
-$$F(\tilde{\mu}) = \left[\frac{1}{2}\left(\dot{\tilde{\mu}} - D\tilde{\mu} - \tilde{\mu}_{\text{prior}}\right)^2\Pi_{\text{prior}} - \frac{1}{2}\ln|\Pi_{\text{obs}}| - \frac{1}{2}\ln|\Pi_{\text{prior}}|\right] - \left[-\frac{1}{2}\left(\tilde{y} - g(\tilde{\mu})\right)^2\Pi_{\text{obs}}\right]$$
+$$F(\tilde{\mu}) = \left[\frac{1}{2}\left(\dot{\tilde{\mu}} + D\tilde{\mu} - \tilde{\mu}_{\text{prior}}\right)^2\Pi_{\text{prior}} - \frac{1}{2}\ln|\Pi_{\text{obs}}| - \frac{1}{2}\ln|\Pi_{\text{prior}}|\right] - \left[-\frac{1}{2}\left(\tilde{y} - g(\tilde{\mu})\right)^2\Pi_{\text{obs}}\right]$$
 
 In the supplied code, the calculation is organized as follows:
 
