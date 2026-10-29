@@ -19,9 +19,6 @@ class Agent_DAIH():
         self.functions_map = None
         self.inputs_map = None
 
-        self.learning_rate = 0.1
-        self.lr_motor = 0.1
-
         self.pi_threshold = {}
         self.actions_id = {}
         self.pi_obs_substitued = {}
@@ -96,7 +93,7 @@ class Agent_DAIH():
                 # Data prprocessing
                 prepared = preprocessing.preprocessing_layer_for_free_energy(state_name, 
                                                             self.navigator, self.functions_map, self.inputs_map, 
-                                                            self.graph, self.Q_, self.pi_priors, 
+                                                            self.Q_, self.pi_priors, 
                                                             self.pi_obs, observations
                                                             )
                 gamma_obs = torch.log(prepared["pi_obs"]).requires_grad_(True)
@@ -112,17 +109,19 @@ class Agent_DAIH():
                         gamma_obs,
                         prepared["prediction"].requires_grad_(True),
                     )
+                # pi obs for calculate lr
+                pi_obs_for_lr = prepared["pi_obs"]
 
                 # command motors
-                motors = self.motor_command(state_name, F, prepared["prediction"])
+                motors = self.motor_command(state_name, F, prepared["prediction"], pi_obs_for_lr)
 
                 # mean update
                 new_posterior = inference.euler_update(prepared["state_posterior"], 0.1, F)
 
                 # Π_obs update
-                new_gamma_obs = utils.update_wih_grad_desc(gamma_obs, F, dt=0.1, k=1.0)
-                new_pi_actual = torch.clamp(torch.exp(new_gamma_obs), min=1e-9).detach()
-                self.pi_obs = inference.update_pi_obs(self.navigator, self.pi_obs, new_pi_actual, self.Q_, state_name)
+                self.pi_obs = inference.update_pi_obs(self.navigator, self.pi_obs, gamma_obs, F, self.Q_, state_name, pi_obs_for_lr, 
+                                                      dt=0.1, iter=1
+                                                    )
 
                 # covariance update
                 new_precision_hessian = inference.second_derivative_F(prepared["state_posterior"], F)
@@ -228,7 +227,8 @@ class Agent_DAIH():
 
             # Update Π_P
             try:
-                next_pi_p = utils.update_wih_grad_desc(pi_p, error_eps, dt=0.1, k=100)
+                lr = inference.get_lr(pi_p, i)
+                next_pi_p = utils.update_wih_grad_desc(pi_p, error_eps, dt=0.1, k=lr)
                 self.pi_p[state_name] = torch.clamp(next_pi_p, min=1e-9, max=1e+6).detach()
             except UnboundLocalError:
                 print("None policies")
@@ -251,7 +251,8 @@ class Agent_DAIH():
                         }
 
     
-    def motor_command(self, current_state, F, g_output):
+    def motor_command(self, current_state, F, g_output, pi_obs):
+        lr = inference.get_lr(pi_obs)
         states = self.navigator.states_with_motors()
 
         if current_state not in states:
@@ -271,7 +272,7 @@ class Agent_DAIH():
             return {}
 
         # Descente de gradient sur le vecteur complet grad descente on complet output_g
-        new_y = utils.update_wih_grad_desc(g_output, F, dt=0.1, k=1.0)
+        new_y = utils.update_wih_grad_desc(g_output, F, dt=0.1, k=lr)
 
         # Keep only the envolved motors
         return {
