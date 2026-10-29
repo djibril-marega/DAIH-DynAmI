@@ -5,15 +5,11 @@ import math, copy
 # Deep Active Inference Hybride Framework with Dynamic Planning Horizon and Amortized Active Inference (DAIH-DynAmI)
 class Agent_DAIH():
     def __init__(self):
-        #super().__init__()
         self.D = None
     
         self.pi_obs = {}
-
         self.covariances = None
-
         self.state_priors = None
-
         self.pi_priors = None
 
         self.Q_ = None
@@ -24,16 +20,13 @@ class Agent_DAIH():
         self.inputs_map = None
 
         self.learning_rate = 0.1
-        self.num_iterations = 100
-
-        self.gamma = 1
-        self.max_motor_iters = 100
         self.lr_motor = 0.1
 
         self.pi_threshold = {}
         self.actions_id = {}
-
         self.pi_obs_substitued = {}
+
+        self.max_policies_iter = 100
     
     
     def model(self, generative_functions=None, functions_map=None, observations=None, actions=None, pi_p=None):
@@ -179,6 +172,12 @@ class Agent_DAIH():
         i = 0
         while True:
             i += 1
+            if i >= self.max_policies_iter:
+                raise RuntimeError(
+                    f"Policy selection exceeded the limit of {self.max_policies_iter} "
+                    f"iterations. Interrupted to prevent an infinite loop."
+                )
+
             policies_candidats = model_components.get_policy_candidates(self.navigator, self.functions_map, self.inputs_map)
             admited_candidats = []
             is_policy_finded = False
