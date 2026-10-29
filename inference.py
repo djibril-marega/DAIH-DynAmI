@@ -1,7 +1,7 @@
-
 import torch
 import torch.distributions as dist
 import utils
+import copy
 
 def euler_update(mu, dt, F_value):
     # Gradient of F with respect to each mu_i
@@ -131,24 +131,89 @@ def update_pi_prior(pi_prior, hessian, state_name, eps=1e-6):
     return pi_prior
 
 
-def update_threshold(list_pi_priors, F_list, pi_threshold, dt=0.1, k=1.0):
-    list_grad = []
+import torch
 
-    for pi_prior, F in zip(list_pi_priors, F_list):
-        grad_F = torch.autograd.grad(
-            F,
-            pi_prior,
-            create_graph=True,
-            retain_graph=True
-        )[0]
 
-        list_grad.append(torch.sum(grad_F))
+def update_pi_obs(navigator, pi_obs, new_pi_actual, Q_, state_name):
+    """
+    Updates pi_obs using the observation entries of new_pi_actual.
 
-    grad_sum = torch.stack(list_grad).sum()   
-    pi_threshold_new = pi_threshold - k * dt * grad_sum
+    State outputs are skipped because their precisions are already
+    determined by Q_.
 
-    return pi_threshold_new
+    Observation outputs:
+        - Individual observations: update pi_obs[observation_name].
+        - Observation groups: update each individual observation
+          belonging to the group.
 
+    The ordering follows navigator.output_g(state_name) and the same
+    ordering used by get_actual_precision.
+    """
+
+    new_pi_actual = torch.as_tensor(new_pi_actual).detach().reshape(-1)
+    outputs_g = navigator.output_g(state_name)
+
+    idx = 0
+
+    for output in outputs_g:
+
+        # --------------------------------------------------
+        # 1. State output: skip its precision entries
+        # --------------------------------------------------
+        if output in Q_:
+
+            for q in Q_[output]:
+
+                if hasattr(q, "covariance_matrix"):
+                    covariance = torch.as_tensor(q.covariance_matrix)
+
+                    if covariance.ndim <= 1:
+                        n = covariance.numel()
+                    else:
+                        n = min(covariance.shape)
+
+                elif hasattr(q, "scale"):
+                    n = torch.as_tensor(q.scale).numel()
+
+                else:
+                    raise TypeError(
+                        f"Cannot retrieve dimensions for '{output}'."
+                    )
+
+                idx += n
+
+            continue
+
+        # --------------------------------------------------
+        # 2. Individual observation or group of observations
+        # --------------------------------------------------
+        try:
+            output_type = navigator.type(output)
+        except KeyError:
+            output_type = None
+
+        if output_type == "observation":
+            observations = [output]
+        else:
+            observations = navigator.get_observations_by_group(output)
+
+            if not observations:
+                continue
+
+        # --------------------------------------------------
+        # 3. Update each individual observation
+        # --------------------------------------------------
+        for observation in observations:
+
+            if idx >= new_pi_actual.numel():
+                raise ValueError(
+                    "new_pi_actual does not contain enough precision values."
+                )
+
+            pi_obs[observation] = new_pi_actual[idx].clone()
+            idx += 1
+
+    return pi_obs
 
 
 def jacobian_from_output(f_out, mu, Pi_bruit=None, eps=1e-6):
@@ -226,6 +291,25 @@ def jacobian_from_output(f_out, mu, Pi_bruit=None, eps=1e-6):
     return Pi
 
 
+def update_threshold(list_pi_priors, F_list, pi_threshold, dt=0.1, k=1.0):
+    list_grad = []
+
+    for pi_prior, F in zip(list_pi_priors, F_list):
+        grad_F = torch.autograd.grad(
+            F,
+            pi_prior,
+            create_graph=True,
+            retain_graph=True
+        )[0]
+
+        list_grad.append(torch.sum(grad_F))
+
+    grad_sum = torch.stack(list_grad).sum()   
+    pi_threshold_new = pi_threshold - k * dt * grad_sum
+
+    return pi_threshold_new
+
+
 def policy_error(G_prior, G_posterior, pi_p):
     return torch.clamp(pi_p*((G_prior - G_posterior) ** 2), max=1e+9)
 
@@ -237,3 +321,62 @@ def update_current_action(best_candidat, actions_id, navigator):
     actions = navigator.get_actions_by_group(action_group_name[0])
     action_one_hot = utils.one_hot(actions, action_name)
     return action_group_name, action_one_hot
+
+
+
+def handle_missing_observations(observations_actual, pi_obs, pi_obs_substitued, low_precision=1e-7, substitute_value=0.0):
+    """
+    Handles missing observations and restores their original precisions.
+
+    Args:
+        observations_actual (dict): Observations grouped by name.
+        pi_obs (dict): Precision of each individual observation.
+        pi_obs_substitued (dict): Backup of original precisions for
+            currently missing observations.
+        low_precision (float): Precision assigned to missing observations.
+        substitute_value (float): Numerical value replacing None.
+
+    Returns:
+        tuple:
+            - observations_actual
+            - pi_obs
+            - pi_obs_substitued
+    """
+
+    for group, observations in observations_actual.items():
+
+        for observation, value in observations.items():
+
+            # --------------------------------------------------
+            # 1. Missing observation
+            # --------------------------------------------------
+            if value is None:
+
+                # Save the original precision only once.
+                if observation not in pi_obs_substitued:
+
+                    if observation in pi_obs:
+                        pi_obs_substitued[observation] = copy.deepcopy(
+                            pi_obs[observation]
+                        )
+
+                # Reduce its influence during inference.
+                pi_obs[observation] = torch.tensor(
+                    low_precision,
+                    dtype=torch.float32
+                )
+
+                # Replace None with a numerical value.
+                observations[observation] = substitute_value
+
+            # --------------------------------------------------
+            # 2. Observation available again
+            # --------------------------------------------------
+            elif observation in pi_obs_substitued:
+
+                # Restore the original precision if it was saved.
+                pi_obs[observation] = pi_obs_substitued.pop(observation)
+
+    return observations_actual, pi_obs, pi_obs_substitued
+
+

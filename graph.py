@@ -493,6 +493,16 @@ class GraphNavigator:
             f"output_{function_name}", []
         )
 
+    # OBSERVATIONS
+    def get_observations_by_group(self, group_name: str) -> list:
+        """
+        Returns the list of observation names belonging to the specified group.
+        """
+        return [
+            node_name for node_name, properties in self.graph.items()
+            if properties.get('type') == 'observation' and properties.get('group') == group_name
+        ]
+
 
 
 

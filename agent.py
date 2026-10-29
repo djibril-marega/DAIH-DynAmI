@@ -8,7 +8,7 @@ class Agent_DAIH():
         #super().__init__()
         self.D = None
     
-        self.pi_obs = None
+        self.pi_obs = {}
 
         self.covariances = None
 
@@ -25,20 +25,18 @@ class Agent_DAIH():
 
         self.learning_rate = 0.1
         self.num_iterations = 100
-        self.tolerance_F = 1e-5
-        self.tolerance_Q = 1e-5
 
         self.gamma = 1
         self.max_motor_iters = 100
         self.lr_motor = 0.1
-        self.tolerance_F_motor = 1e-5
-        self.tolerance_action = 1e-5
 
         self.pi_threshold = {}
         self.actions_id = {}
+
+        self.pi_obs_substitued = {}
     
     
-    def model(self, generative_functions=None, functions_map=None, observations=None, pi_obs=None, actions=None, pi_p=None):
+    def model(self, generative_functions=None, functions_map=None, observations=None, actions=None, pi_p=None):
         states = model.validate_model(self.D, generative_functions, actions)
         _, idx_to_actions = model.actions_index(actions)
         self.actions_id = idx_to_actions
@@ -63,14 +61,19 @@ class Agent_DAIH():
 
         self.pi_p, self.inputs_map = model.init_p(generative_functions, self.pi_priors,  pi_p, self.inputs_map)
 
-        self.pi_obs = model.init_observations(states, pi_obs)
-
         self.pi_threshold = model.sum_priors(self.pi_priors, self.navigator)
 
 
 
 
     def inference(self, observations):
+        #print("inside pi obs: ", self.pi_obs)
+        (
+            observations, 
+            self.pi_obs, 
+            self.pi_obs_substitued
+        ) = inference.handle_missing_observations(observations, self.pi_obs, self.pi_obs_substitued)
+
         for motors in self.beliefs_update(observations):
             yield f"action motor: {motors}"
 
@@ -125,7 +128,8 @@ class Agent_DAIH():
 
                 # Π_obs update
                 new_gamma_obs = utils.update_wih_grad_desc(gamma_obs, F, dt=0.1, k=1.0)
-                self.pi_obs[state_name] = torch.clamp(torch.exp(new_gamma_obs), min=1e-9).detach()
+                new_pi_actual = torch.clamp(torch.exp(new_gamma_obs), min=1e-9).detach()
+                self.pi_obs = inference.update_pi_obs(self.navigator, self.pi_obs, new_pi_actual, self.Q_, state_name)
 
                 # covariance update
                 new_precision_hessian = inference.second_derivative_F(prepared["state_posterior"], F)

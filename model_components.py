@@ -117,47 +117,38 @@ def get_actual(navigator, Q_, state, observations):
 
 
 
-def get_actual_precision(navigator, pi_obs, graph, Q_, state):
+def get_actual_precision(navigator, pi_obs, Q_, state):
     """
-    Builds a flattened precision vector for the children of a state.
+    Builds the precision vector following navigator.output_g(state).
 
-    - Child of type state: individual precision of each dimension
-      of each Q_ distribution (inverse of the variance).
-    - Child of type observation: all observations in the same
-      group share the same precision.
-    - The order of elements follows the order of the graph's children.
+    State outputs:
+        Inverse marginal variances from Q_.
 
-    Returns
-    -------
-    torch.Tensor
-        1D precision vector.
+    Individual observation outputs:
+        Use pi_obs[observation], or 1 if missing.
+
+    Observation group outputs:
+        Retrieve group observations and use their individual
+        precisions from pi_obs, or 1 if missing.
+
+    Unknown outputs are ignored.
     """
 
     dtype = torch.float32
     device = torch.device("cpu")
     precision_values = []
 
-    children = navigator.children(state)
-    i = 0
+    outputs_g = navigator.output_g(state)
 
-    while i < len(children):
-        child_node = children[i]["node"]
-        node_type = navigator.type(child_node)
+    for output in outputs_g:
 
         # --------------------------------------------------
-        # 1. Child corresponding to a state
+        # 1. State output
         # --------------------------------------------------
-        if node_type == "state":
+        if output in Q_:
 
-            if child_node not in Q_:
-                raise KeyError(
-                    f"No Q_ distribution is defined for '{child_node}'."
-                )
+            for q in Q_[output]:
 
-            for q in Q_[child_node]:
-
-                # Case of a full covariance matrix:
-                # extract only the marginal variances.
                 if hasattr(q, "covariance_matrix"):
                     covariance = torch.as_tensor(
                         q.covariance_matrix,
@@ -165,110 +156,89 @@ def get_actual_precision(navigator, pi_obs, graph, Q_, state):
                         device=device
                     )
 
-                    if covariance.ndim == 0:
-                        variances = covariance.reshape(1)
-                    elif covariance.ndim == 1:
-                        variances = covariance
+                    if covariance.ndim <= 1:
+                        variances = covariance.reshape(-1)
                     else:
                         variances = torch.diagonal(covariance)
 
-                # Case where standard deviations are accessible via scale.
                 elif hasattr(q, "scale"):
                     scale = torch.as_tensor(
                         q.scale,
                         dtype=dtype,
                         device=device
-                    ).reshape(-1)
-
-                    variances = scale.square()
+                    )
+                    variances = scale.square().reshape(-1)
 
                 else:
                     raise TypeError(
-                        f"Unable to retrieve the variances "
-                        f"of the distribution for '{child_node}'."
+                        f"Cannot retrieve variances for '{output}'."
                     )
 
                 if torch.any(variances <= 0):
                     raise ValueError(
-                        f"The variances of '{child_node}' "
-                        "must be strictly positive."
+                        f"Variances for '{output}' must be positive."
                     )
 
-                # One precision value per dimension, without a matrix.
-                precision_values.append(variances.reciprocal().reshape(-1))
-
-            i += 1
-
-        # --------------------------------------------------
-        # 2. Child corresponding to an observation
-        # --------------------------------------------------
-        elif node_type == "observation":
-
-            group = graph[child_node].get("group", child_node)
-            group_children = []
-
-            # Collect consecutive observations belonging to the same group.
-            while i < len(children):
-                candidate = children[i]["node"]
-
-                if navigator.type(candidate) != "observation":
-                    break
-
-                candidate_group = graph[candidate].get(
-                    "group", candidate
+                precision_values.append(
+                    variances.reciprocal().reshape(-1)
                 )
 
-                if candidate_group != group:
-                    break
+            continue
 
-                group_children.append(candidate)
-                i += 1
+        # --------------------------------------------------
+        # 2. Individual observation
+        # --------------------------------------------------
+        try:
+            output_type = navigator.type(output)
+        except KeyError:
+            output_type = None
 
-            # Retrieve the group's precision.
-            n = len(group_children)
+        if output_type == "observation":
+            observations = [output]
 
-            if isinstance(pi_obs, dict) and group in pi_obs:
-                precision_value = torch.as_tensor(
-                    pi_obs[group],
+        else:
+            # --------------------------------------------------
+            # 3. Observation group
+            # --------------------------------------------------
+            observations = navigator.get_observations_by_group(output)
+
+            if not observations:
+                continue
+
+        # --------------------------------------------------
+        # 4. Retrieve each observation's precision
+        # --------------------------------------------------
+        for observation in observations:
+
+            precision = (
+                pi_obs.get(observation)
+                if isinstance(pi_obs, dict)
+                else None
+            )
+
+            if isinstance(precision, torch.Tensor):
+                precision = precision.to(
+                    dtype=dtype,
+                    device=device
+                ).reshape(-1)
+            else:
+                precision = torch.ones(
+                    1,
                     dtype=dtype,
                     device=device
                 )
 
-                if precision_value.numel() == n:
-                    # The vector already has the correct size: keep it as is.
-                    precision_values.append(precision_value.reshape(-1))
-
-                elif precision_value.numel() == 1:
-                    # Scalar: repeat it for each observation.
-                    precision_values.append(
-                        precision_value.reshape(()).expand(n).clone()
-                    )
-
-                else:
-                    raise ValueError(
-                        f"Group '{group}' contains {n} observations, "
-                        f"but pi_obs contains {precision_value.numel()} elements."
-                    )
-
-            else:
-                # No precision specified: default precision is 1.
-                precision_values.append(
-                    torch.ones(n, dtype=dtype, device=device)
-                )
-
-        else:
-            # Skip actions and other node types.
-            i += 1
+            precision_values.append(precision)
 
     # --------------------------------------------------
-    # 3. Concatenate all precision values into a 1D vector
+    # 5. Concatenate
     # --------------------------------------------------
     if not precision_values:
         return torch.empty(0, dtype=dtype, device=device)
 
     return torch.cat(precision_values)
 
-
+        
 
 
 
@@ -313,21 +283,6 @@ def get_transition_prediction(
     return preprocessing.execute_flat_function(
         navigator, functions_map, local_inputs, state, "f"
     )
-
-
-def get_policy_variance(navigator, functions_map, inputs_map, state, std, obs_variance):
-    _, J = get_state_prediction(
-        navigator, functions_map, inputs_map, state, Jacobian=True
-    )
-
-    # jacrev of a vector output with a dictionary of inputs returns a
-    # dictionary keyed by input name. Flatten each input's Jacobian block.
-    J_matrix = torch.cat([
-        value.reshape(-1) for value in J.values()
-    ]).reshape(1, -1)
-
-    J_transposed = J_matrix.T
-    return torch.sum((J_matrix * (std ** 2)) * J_transposed + obs_variance)
 
 
 def get_policy_candidates(navigator, functions_map, inputs_map):
