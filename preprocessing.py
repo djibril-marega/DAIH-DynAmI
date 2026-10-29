@@ -16,8 +16,9 @@ def preprocessing_layer_for_free_energy(state_name, navigator, functions_map, in
     actual = model_components.get_actual(navigator, Q_, state_name, observations)
     # - prediction: prediction of g
     prediction = model_components.get_state_prediction(navigator, functions_map, inputs_map, state_name)
+    #print("prediction: ", prediction)
     #  - pi_obs = precision of function g
-    pi_obs_t = model_components.get_actual_precision(navigator, pi_obs, graph, Q_, state_name)
+    pi_obs_t = model_components.get_actual_precision(navigator, pi_obs, Q_, state_name)
 
     # Reshape prior
     state_prior_original = state_prior.reshape_as(state_posterior)

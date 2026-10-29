@@ -89,3 +89,12 @@ def update_wih_grad_desc(x, F, dt=0.1, k=1.0):
     next_x = x - dt * k * grad_F
 
     return next_x
+
+
+def get_keys_none(observation):
+    keys = []
+    for values in observation.values():
+        for key, value in values.items():
+            if value is None:
+                keys.append(key)
+    return keys
