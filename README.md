@@ -51,8 +51,9 @@ The project explores an agent architecture based on the following ideas:
     policy and compare its expected score with its reevaluated score.
 6.  **Fast motor control:** adjust motor outputs using gradient descent
     on variational free energy.
-7.  **Learning and adaptation:** evolve precisions and, eventually,
-    learning rates according to prediction quality.
+7.  **Dynamic learning rates:** adapt update speed according to
+    observation precision during perceptual inference and according to
+    policy precision and iteration count during policy selection.
 
 The design hypothesis is that an agent operating in a dynamic
 environment must be able to make decisions on time and with limited
@@ -241,6 +242,41 @@ the placeholder has negligible influence. When the observation becomes
 available again, its saved precision is restored. See the configuration
 and model-definition guides for the relevant data conventions.
 
+### Dynamic learning rate
+
+The current implementation defines a shared learning-rate helper:
+
+``` python
+def get_lr(precision, iter=1):
+    return precision * iter
+```
+
+For perceptual precision updates, the learning rate is derived from the
+precision supplied by the caller. The intended relationship is:
+
+$$
+lr^{(i)} \propto \Pi_{\text{obs}}^{(i)}
+$$
+
+A high observation precision therefore produces a larger update step,
+whereas a low precision produces a smaller step. The aim is to adapt
+assimilation speed to the reliability represented by the precision. The
+exact behavior depends on the precision passed to `get_lr(...)` by the
+update path.
+
+The observation-precision update uses this rate when applying gradient
+descent to `gamma_obs`:
+
+``` python
+lr = get_lr(pi_of_g)
+new_gamma_obs = utils.update_wih_grad_desc(
+    gamma_obs, F, dt=dt, k=lr
+)
+```
+
+The relationship above describes the intended perceptual rule; it does
+not by itself guarantee stable updates or prevent overfitting.
+
 ### Precisions and distributions
 
 The model uses PyTorch `Normal` or `MultivariateNormal` distributions,
@@ -324,6 +360,39 @@ and a selection among accepted candidates. A bounded retry strategy and
 the behavior when no candidate is accepted remain important validation
 points.
 
+### Dynamic learning rate for policy selection
+
+Policy selection uses both the relevant precision and the iteration
+count to calculate the learning rate:
+
+$$
+lr^{(i)} \propto \Pi_p^{(i)} \times \mathrm{iter}
+$$
+
+In the current code, this rate is passed to the gradient-descent update
+of `pi_p`:
+
+``` python
+lr = inference.get_lr(pi_p, i)
+next_pi_p = utils.update_wih_grad_desc(
+    pi_p, error_eps, dt=0.1, k=lr
+)
+```
+
+This couples the update magnitude to the policy precision and the number
+of iterations. As iterations increase, the learning rate can increase
+as well, potentially accelerating a decision when deliberation takes
+too long. However, the rate is not bounded by `get_lr(...)`; large
+iteration counts or precision values may produce excessively large
+steps. The resulting behavior must be evaluated experimentally.
+
+The intended hypothesis is that increasing update magnitude may create
+oscillations in policy evaluation and eventually break prolonged
+hesitation, forcing a choice before precision collapses. This is an
+intended mechanism, not a guaranteed consequence of the formula; the
+onset of oscillations, the behavior of $\Pi_p$, and whether a policy is
+ultimately selected must be verified in tests.
+
 ### Learning during wakefulness and sleep
 
 The proposed architecture distinguishes two modes:
@@ -349,11 +418,18 @@ $$
 y_{\text{new}} = y_{\text{pred}} - \Delta t \, k \, \frac{\partial F}{\partial y_{\text{pred}}}
 $$
 
-In the supplied code, the call uses
-`utils.update_wih_grad_desc(g_output, F, dt=0.1, k=1.0)`, then returns
-only the components associated with the motors of the relevant state.
-The step size $k$, time step, and stopping criteria are important
-parameters for control stability and speed.
+In the current code, `motor_command(...)` obtains its step size through
+`inference.get_lr(pi_obs)` and passes it to
+`utils.update_wih_grad_desc(g_output, F, dt=0.1, k=lr)`. Since the
+iteration argument is omitted, `get_lr(...)` uses its default value of
+`iter=1`. The method then returns only the components associated with
+the motors of the relevant state.
+
+Consequently, motor-update magnitude depends on the precision value
+passed by this call. The step size, time step, and stopping criteria are
+important parameters for control stability and speed; the precise type
+and meaning of `pi_obs` at this call site should be checked against the
+implementation.
 
 ## Model Configuration
 
@@ -462,23 +538,13 @@ The default values visible in `Agent_DAIH.__init__` include:
   ---------------------------------------------------------------------------
   Parameter                            Initial value Visible purpose
   --------------------- ---------------------------- ------------------------
-  `learning_rate`                              `0.1` General parameter
-                                                     intended for learning;
-                                                     actual usage should be
-                                                     verified.
 
   `max_policies_iter`                           `100` Intended limit for policies
                                                      iterations.
 
-  `lr_motor`                                   `0.1` Intended motor learning
-                                                     rate.
-
   ---------------------------------------------------------------------------
 
-Several calls currently use hard-coded values, including `dt=0.1`,
-`k=1.0` for certain updates, and `k=100` for updating `pi_p`.
-Configuration attributes therefore do not necessarily control every
-calculation at this stage.
+The time step `dt=0.1` remains hard-coded in several update calls.
 
 ## Limitations and Items to Verify
 
@@ -501,35 +567,24 @@ following:
     entries are initialized for all observations used by inference,
     remain positive, and are not unintentionally overwritten during
     precision updates.
+-   **Dynamic learning-rate stability:** `get_lr(precision, iter=1)`
+    multiplies precision by the iteration count without minimum or
+    maximum bounds. Verify that precision values are valid and that
+    iteration-dependent steps do not cause numerical divergence.
+-   **Policy-selection dynamics:** test whether increasing the learning
+    rate actually produces the intended oscillations and decision
+    behavior; neither a precision collapse nor a forced selection follows
+    automatically from the formula.
+-   **Learning-rate call sites:** verify the value and shape passed as
+    `precision` in perceptual, policy, and motor updates, and confirm
+    that each call uses the intended precision.
 -   **Unused parameters:** verify iteration, learning-rate, and
     tolerance attributes before assuming they effectively control
     execution.
 
 ## Roadmap
 
-### Priority 1 — Dynamically adapt learning steps $k$
-
-**Objective:** make updates faster when error is stable and more
-cautious when updates oscillate or diverge.
-
-Ideas to evaluate:
-
--   separate learning rates for belief updates, precision updates,
-    `pi_p`, and motors;
--   reduce the step size when free energy increases or updates become
-    unstable;
--   cautiously increase the step size when progress is steady;
--   bound each step with minimum and maximum values;
--   plot $F$, $G$, precisions, and learning steps to compare behavior.
-
-Validation criteria:
-
--   more stable convergence;
--   no explosion of gradients or precisions;
--   measured settling time;
--   comparison against a fixed learning rate as a baseline.
-
-### Priority 2 — Testing and experimental validation
+### Priority 1 — Testing and experimental validation
 
 -   add unit tests for $F$, $G$, belief updates, and motor control;
 -   test missing values, tensors with different shapes, and extreme
@@ -538,7 +593,7 @@ Validation criteria:
 -   record scores and actions in reproducible scenarios;
 -   document limitations and experimental results.
 
-### Priority 3 — Learning during sleep
+### Priority 2 — Learning during sleep
 
 -   replay trajectories stored during the agent's interactions;
 -   adjust the generative model and policy generator using past
@@ -588,3 +643,4 @@ inference:
 **DAIH-DynAmI**: an experimental hybrid active inference prototype
 exploring coordination between generalized beliefs, amortized policy
 generation, and reflex motor control.
+ 
