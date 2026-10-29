@@ -467,29 +467,12 @@ The default values visible in `Agent_DAIH.__init__` include:
                                                      actual usage should be
                                                      verified.
 
-  `num_iterations`                             `100` Intended number of
-                                                     iterations; actual usage
-                                                     should be verified.
-
-  `tolerance_F`                               `1e-5` Intended tolerance for
-                                                     free energy.
-
-  `tolerance_Q`                               `1e-5` Intended tolerance for
-                                                     beliefs/distributions.
-
-  `gamma`                                        `1` General model parameter.
-
-  `max_motor_iters`                            `100` Intended limit for motor
+  `max_policies_iter`                           `100` Intended limit for policies
                                                      iterations.
 
   `lr_motor`                                   `0.1` Intended motor learning
                                                      rate.
 
-  `tolerance_F_motor`                         `1e-5` Intended tolerance for
-                                                     motor control.
-
-  `tolerance_action`                          `1e-5` Intended tolerance for
-                                                     actions.
   ---------------------------------------------------------------------------
 
 Several calls currently use hard-coded values, including `dt=0.1`,
@@ -546,17 +529,7 @@ Validation criteria:
 -   measured settling time;
 -   comparison against a fixed learning rate as a baseline.
 
-### Priority 2 — Strengthen policy selection
-
--   explicitly determine whether selection should minimize or maximize
-    $G$;
--   limit the number of generation and evaluation cycles;
--   define behavior when no policy meets the tolerance;
--   test whether feeding back the error actually leads to a different
-    proposal;
--   verify adaptation of `pi_p` and the planning horizon.
-
-### Priority 3 — Testing and experimental validation
+### Priority 2 — Testing and experimental validation
 
 -   add unit tests for $F$, $G$, belief updates, and motor control;
 -   test missing values, tensors with different shapes, and extreme
