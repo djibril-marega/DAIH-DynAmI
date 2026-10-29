@@ -28,7 +28,6 @@ def second_derivative_F(mu, F_value):
 
     # Compute the Hessian
     second_derivatives = []
-    n = dF_dmu.numel()
 
     for i in range(dF_dmu.numel()):
         d2F_dmu2 = torch.autograd.grad(
@@ -131,12 +130,15 @@ def update_pi_prior(pi_prior, hessian, state_name, eps=1e-6):
     return pi_prior
 
 
-import torch
-
-
-def update_pi_obs(navigator, pi_obs, new_pi_actual, Q_, state_name):
+def update_pi_obs(navigator, pi_obs, gamma_obs, F, Q_, state_name, pi_of_g, dt=0.1,iter=1):
     """
-    Updates pi_obs using the observation entries of new_pi_actual.
+    Updates observation precisions using gradient descent.
+
+    The function:
+        1. Retrieves the learning rate.
+        2. Updates gamma_obs using gradient descent.
+        3. Converts gamma_obs into actual precisions.
+        4. Updates pi_obs using observation entries only.
 
     State outputs are skipped because their precisions are already
     determined by Q_.
@@ -150,7 +152,34 @@ def update_pi_obs(navigator, pi_obs, new_pi_actual, Q_, state_name):
     ordering used by get_actual_precision.
     """
 
-    new_pi_actual = torch.as_tensor(new_pi_actual).detach().reshape(-1)
+    # --------------------------------------------------
+    # 1. Retrieve the learning rate
+    # --------------------------------------------------
+    lr = get_lr(pi_of_g, iter=iter)
+
+    # --------------------------------------------------
+    # 2. Update gamma_obs using gradient descent
+    # --------------------------------------------------
+    new_gamma_obs = utils.update_wih_grad_desc(
+        gamma_obs,
+        F,
+        dt=dt,
+        k=lr,
+    )
+
+    # --------------------------------------------------
+    # 3. Convert gamma_obs into actual precisions
+    # --------------------------------------------------
+    new_pi_actual = torch.clamp(
+        torch.exp(new_gamma_obs),
+        min=1e-9,
+    ).detach()
+
+    new_pi_actual = torch.as_tensor(new_pi_actual).reshape(-1)
+
+    # --------------------------------------------------
+    # 4. Update observation precisions in pi_obs
+    # --------------------------------------------------
     outputs_g = navigator.output_g(state_name)
 
     idx = 0
@@ -158,7 +187,7 @@ def update_pi_obs(navigator, pi_obs, new_pi_actual, Q_, state_name):
     for output in outputs_g:
 
         # --------------------------------------------------
-        # 1. State output: skip its precision entries
+        # State output: skip its precision entries
         # --------------------------------------------------
         if output in Q_:
 
@@ -185,7 +214,7 @@ def update_pi_obs(navigator, pi_obs, new_pi_actual, Q_, state_name):
             continue
 
         # --------------------------------------------------
-        # 2. Individual observation or group of observations
+        # Individual observation or group of observations
         # --------------------------------------------------
         try:
             output_type = navigator.type(output)
@@ -201,7 +230,7 @@ def update_pi_obs(navigator, pi_obs, new_pi_actual, Q_, state_name):
                 continue
 
         # --------------------------------------------------
-        # 3. Update each individual observation
+        # Update each individual observation
         # --------------------------------------------------
         for observation in observations:
 
@@ -378,5 +407,8 @@ def handle_missing_observations(observations_actual, pi_obs, pi_obs_substitued, 
                 pi_obs[observation] = pi_obs_substitued.pop(observation)
 
     return observations_actual, pi_obs, pi_obs_substitued
+
+def get_lr(precision, iter=1):
+    return precision*iter
 
 

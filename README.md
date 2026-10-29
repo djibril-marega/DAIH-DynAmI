@@ -538,7 +538,7 @@ Validation criteria:
 -   record scores and actions in reproducible scenarios;
 -   document limitations and experimental results.
 
-### Priority 4 — Learning during sleep
+### Priority 3 — Learning during sleep
 
 -   replay trajectories stored during the agent's interactions;
 -   adjust the generative model and policy generator using past

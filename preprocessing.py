@@ -2,7 +2,7 @@ import model_components, utils
 import torch
 from collections.abc import Mapping
 
-def preprocessing_layer_for_free_energy(state_name, navigator, functions_map, inputs_map, graph, Q_, pi_priors, pi_obs, observations):
+def preprocessing_layer_for_free_energy(state_name, navigator, functions_map, inputs_map, Q_, pi_priors, pi_obs, observations):
     # 2. Update state by state
     #  - state_prior = output of function f for the state (must have the same size as Q)
     state_prior = model_components.get_transition_prediction(navigator, functions_map, inputs_map, state_name)
