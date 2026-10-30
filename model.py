@@ -176,18 +176,10 @@ def validate_model(D, generative_functions, actions=None):
 
 
 
-def make_distributions(mu, variance, covariance=None):
+def make_distributions(mu, variance=None, covariance=None):
     """Builds distributions according to the shape of mu."""
 
     mu_t = torch.as_tensor(mu, dtype=torch.float32)
-    var_t = torch.as_tensor(variance, dtype=torch.float32)
-
-    if mu_t.shape != var_t.shape:
-        raise ValueError(
-            "mu and variance must have exactly "
-            f"the same shape: {tuple(mu_t.shape)} "
-            f"!= {tuple(var_t.shape)}."
-        )
 
     if mu_t.ndim > 2:
         raise ValueError(
@@ -198,39 +190,48 @@ def make_distributions(mu, variance, covariance=None):
     if not torch.isfinite(mu_t).all():
         raise ValueError("mu contains non-finite values.")
 
-    if not torch.isfinite(var_t).all() or (var_t <= 0).any():
+    # Covariance is only valid for multivariate distributions
+    if covariance is not None and mu_t.ndim != 2:
         raise ValueError(
-            "All variances must be finite "
-            "and strictly positive."
+            "covariance can only be defined "
+            "for a 2D mu (MultivariateNormal)."
         )
 
-    # Scalar distribution
-    if mu_t.ndim == 0:
-        if covariance is not None:
+    # Scalar and 1D distributions
+    if mu_t.ndim <= 1:
+
+        var_t = torch.as_tensor(
+            1 if variance is None else variance,
+            dtype=torch.float32,
+        )
+
+        if mu_t.shape != var_t.shape:
             raise ValueError(
-                "covariance does not apply "
-                "to a scalar distribution."
+                "mu and variance must have exactly "
+                "the same shape."
             )
 
-        return [dist.Normal(mu_t, torch.sqrt(var_t))]
-
-    # One scalar distribution per element
-    if mu_t.ndim == 1:
-        if covariance is not None:
+        if not torch.isfinite(var_t).all() or (var_t <= 0).any():
             raise ValueError(
-                "For a 1D list, use scalar distributions "
-                "or a 2D list with a single row."
+                "All variances must be finite "
+                "and strictly positive."
             )
+
+        if mu_t.ndim == 0:
+            return [
+                dist.Normal(mu_t, torch.sqrt(var_t))
+            ]
 
         return [
             dist.Normal(mu_t[i], torch.sqrt(var_t[i]))
             for i in range(mu_t.shape[0])
         ]
 
-    # One multivariate distribution per row
+    # Multivariate distributions
     n_distributions, dimension = mu_t.shape
 
     if covariance is not None:
+
         cov_t = torch.as_tensor(
             covariance,
             dtype=torch.float32,
@@ -248,43 +249,94 @@ def make_distributions(mu, variance, covariance=None):
                 f"received: {tuple(cov_t.shape)}."
             )
 
+        if not torch.isfinite(cov_t).all():
+            raise ValueError(
+                "covariance contains non-finite values."
+            )
+
+        # Symmetry validation
         if not torch.allclose(
-            torch.diagonal(cov_t, dim1=-2, dim2=-1),
-            var_t,
+            cov_t,
+            cov_t.transpose(-1, -2),
             rtol=1e-5,
             atol=1e-6,
         ):
             raise ValueError(
-                "The diagonal of covariance must match "
-                "the variance values."
+                "covariance matrices must be symmetric."
             )
+
+        # Extract variances
+        var_t = torch.diagonal(
+            cov_t,
+            dim1=-2,
+            dim2=-1,
+        )
+
+        # Optional variance consistency validation
+        if variance is not None:
+
+            provided_var = torch.as_tensor(
+                variance,
+                dtype=torch.float32,
+            )
+
+            if provided_var.shape != mu_t.shape:
+                raise ValueError(
+                    "variance must have the same shape as mu."
+                )
+
+            if not torch.allclose(
+                var_t,
+                provided_var,
+                rtol=1e-5,
+                atol=1e-6,
+            ):
+                raise ValueError(
+                    "The diagonal of covariance must match "
+                    "the variance values."
+                )
+
     else:
+
+        var_t = torch.as_tensor(
+            1 if variance is None else variance,
+            dtype=torch.float32,
+        )
+
+        if mu_t.shape != var_t.shape:
+            raise ValueError(
+                "mu and variance must have exactly "
+                "the same shape."
+            )
+
         cov_t = torch.diag_embed(var_t)
+
+    # Variance validation
+    if not torch.isfinite(var_t).all() or (var_t <= 0).any():
+        raise ValueError(
+            "All variances must be finite "
+            "and strictly positive."
+        )
 
     distributions = []
 
     for i in range(n_distributions):
-        if not torch.allclose(
-            cov_t[i],
-            cov_t[i].T,
-            rtol=1e-5,
-            atol=1e-6,
-        ):
-            raise ValueError(
-                f"covariance[{i}] must be symmetric."
-            )
 
         try:
+            # Cholesky decomposition also validates
+            # positive definiteness.
+            torch.linalg.cholesky(cov_t[i])
+
             distributions.append(
                 dist.MultivariateNormal(
                     loc=mu_t[i],
                     covariance_matrix=cov_t[i],
                 )
             )
+
         except (ValueError, RuntimeError) as exc:
             raise ValueError(
-                f"covariance[{i}] is not a valid covariance "
-                "matrix. It must be positive definite."
+                f"covariance[{i}] must be positive definite."
             ) from exc
 
     return distributions
@@ -293,21 +345,25 @@ def make_distributions(mu, variance, covariance=None):
 
 
 def inverse_variance(value):
-    """Recursively computes the inverse of variances."""
+    """Computes the element-wise inverse of variances."""
 
-    if isinstance(value, (list, tuple)):
-        return [
-            inverse_variance(v)
-            for v in value
-        ]
+    value_t = torch.as_tensor(
+        value,
+        dtype=torch.float32,
+    )
 
-    if value <= 0:
+    if not torch.isfinite(value_t).all() or (value_t <= 0).any():
         raise ValueError(
-            "All variances must be "
-            "strictly positive."
+            "All variances must be finite "
+            "and strictly positive."
         )
 
-    return 1.0 / value
+    result = 1.0 / value_t
+
+    if result.ndim == 0:
+        return result.item()
+
+    return result
 
 
 def init_distributions(D, states, pi_priors=None):
@@ -322,33 +378,66 @@ def init_distributions(D, states, pi_priors=None):
     pi_priors = {} if pi_priors is None else dict(pi_priors)
 
     for state_name in states:
+
         params = D[state_name]
 
         mu = params.get("mu", 1)
-        variance = params.get("variance", 1)
+        variance = params.get("variance")
         covariance = params.get("covariance")
 
+        # Build distributions and validate parameters
         Q_[state_name] = make_distributions(
             mu,
             variance,
             covariance,
         )
 
-        mu_dict[state_name] = torch.as_tensor(
-            mu, dtype=torch.float32
+        mu_t = torch.as_tensor(
+            mu,
+            dtype=torch.float32,
         )
 
-        variance_dict[state_name] = torch.as_tensor(
-            variance, dtype=torch.float32
-        )
+        # Recover effective variance
+        if covariance is not None:
+
+            cov_t = torch.as_tensor(
+                covariance,
+                dtype=torch.float32,
+            )
+
+            variance_t = torch.diagonal(
+                cov_t,
+                dim1=-2,
+                dim2=-1,
+            )
+
+            covariances[state_name] = cov_t
+
+        else:
+
+            variance_t = torch.as_tensor(
+                1 if variance is None else variance,
+                dtype=torch.float32,
+            )
+
+            # Store the equivalent covariance matrix
+            if mu_t.ndim == 2:
+                covariances[state_name] = torch.diag_embed(
+                    variance_t
+                )
+            else:
+                covariances[state_name] = None
+
+        mu_dict[state_name] = mu_t
+        variance_dict[state_name] = variance_t
 
         # Preserve aliases
-        state_priors[state_name] = mu_dict[state_name]
-        covariances[state_name] = variance_dict[state_name]
+        state_priors[state_name] = mu_t
 
+        # Initialize priors if not provided
         if state_name not in pi_priors:
             pi_priors[state_name] = torch.as_tensor(
-                inverse_variance(variance),
+                inverse_variance(variance_t),
                 dtype=torch.float32,
             )
 

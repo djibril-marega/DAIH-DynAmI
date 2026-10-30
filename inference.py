@@ -408,7 +408,7 @@ def handle_missing_observations(observations_actual, pi_obs, pi_obs_substitued, 
 
     return observations_actual, pi_obs, pi_obs_substitued
 
-def get_lr(precision, iter=1):
+def get_lr(precision, iter=1): # update this function implementation
     return precision*iter
 
 
