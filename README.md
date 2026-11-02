@@ -200,7 +200,7 @@ state must exist in `inputs_map`, and its identifier is obtained from its
 position in `states_list`:
 
 $$
-\text{state\_id} = \operatorname{index}(\text{state\_name}) + 1
+\text{state\_id} = \text{index}(\text{state\_name}) + 1
 $$
 
 The layer identifier is obtained from
@@ -607,12 +607,12 @@ starting template, not a guaranteed runnable example.
 
 The default values visible in `Agent_DAIH.__init__` include:
 
-  ---------------------------------------------------------------------------
-  Parameter                            Initial value Visible purpose
-  --------------------- ---------------------------- ------------------------
-
-  `max_policies_iter`                           `100` Intended limit for policies
-                                                     iterations.
+| Parameter             | Default value | Description                              |
+|-----------------------|---------------|------------------------------------------|
+| `max_policies_iter`   | `100`         | Intended limit for policy iterations.    |
+| `lr_motors`            | `1`           | Learning rate for motor generation.      |
+| `self.lr_policies`     | `1`           | Learning rate for policy precision update.     |
+| `self.lr_obs`          | `1`           | Learning rate for observation precision update.|                                                                    
 
   ---------------------------------------------------------------------------
 
