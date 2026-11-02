@@ -567,7 +567,7 @@ multiple observation outputs by this mapping rule.
 
 An individual observation contributes one value. An observation group
 contributes as many values as it contains individual observations. If the
-corresponding sizes are \(s_1,\ldots,s_n\), the expected total is:
+corresponding sizes are $s_1,\ldots,s_n$, the expected total is:
 
 $$
 N_{\text{expected}} = \sum_{j=1}^{n}s_j
@@ -576,17 +576,12 @@ $$
 ### Tensor outputs
 
 For a `torch.Tensor`, the last dimension must have exactly
-\(N_{\text{expected}}\) elements. The tensor is split along its last
+$N_{\text{expected}}$ elements. The tensor is split along its last
 dimension:
 
 $$
-\text{chunks}
-=
-\operatorname{torch.split}
-\left(
-\text{output},
-(s_1,\ldots,s_n),
-\text{dim}=-1
+\mathrm{chunks} = \mathrm{torch.split}\left(
+\mathrm{output}, (s_1,\ldots,s_n), \mathrm{dim}=-1
 \right)
 $$
 
@@ -595,13 +590,13 @@ This preserves the other dimensions of the tensor and the order of
 
 ### Tuple and list outputs
 
-For a tuple or list, its length must equal \(N_{\text{expected}}\).
+For a tuple or list, its length must equal $N_{\text{expected}}$.
 Consecutive slices are then assigned to each declared output name according
 to its size.
 
 For example, if the declared outputs are one individual observation
 followed by a group of two observations, the sequence is partitioned into
-slices of lengths \(1\) and \(2\).
+slices of lengths $1$ and $2$.
 
 ### Errors and return structure
 

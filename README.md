@@ -200,7 +200,7 @@ state must exist in `inputs_map`, and its identifier is obtained from its
 position in `states_list`:
 
 $$
-\text{state\_id} = \text{index}(\text{state\_name}) + 1
+\mathrm{state\_id} = \mathrm{index}(\mathrm{state\_name}) + 1
 $$
 
 The layer identifier is obtained from
@@ -248,9 +248,9 @@ distribution uses the product of its event dimensions:
 $$
 w(d) =
 \begin{cases}
-1 & \text{if } \operatorname{event\_shape}(d) = () \\
+1 & \text{if } \mathrm{event\_shape}(d) = () \\
 \displaystyle\prod_{k=1}^{m} s_k
-& \text{if } \operatorname{event\_shape}(d) = (s_1,\ldots,s_m)
+& \text{if } \mathrm{event\_shape}(d) = (s_1,\ldots,s_m)
 \end{cases}
 $$
 
@@ -260,21 +260,20 @@ The product is implemented with `math.prod(event_shape)`.
 separates them by connection type:
 
 -   **Observation children:** contribute one row and one column per
-    individual observation. For \(n_o\) observations, their shape is
-    \((1,n_o)\).
+    individual observation. For $n_o$ observations, their shape is
+    $(1,n_o)$.
 -   **Hierarchy children:** their distributions are retrieved from `Q_`.
     The number of distributions determines the row count, and the event
     shape of the first distribution determines the column count. All
     distributions belonging to that child must have the same width.
 -   **Action children:** are ignored when calculating the output shape.
 
-Let the contributing child shapes be \((R_1,C_1),\ldots,(R_n,C_n)\). They
-must all have the same row count \(R\). The resulting shape concatenates
-their columns:
+Let the contributing child shapes be
+$(R_1,C_1),\ldots,(R_n,C_n)$. They must all have the same row count
+$R$. The resulting shape concatenates their columns:
 
 $$
-\operatorname{output\_shape}
-=
+\mathrm{output\_shape} =
 \left(R,\sum_{i=1}^{n} C_i\right)
 $$
 
@@ -307,25 +306,18 @@ $$
 N_{\text{expected}} = \sum_{j=1}^{n} s_j
 $$
 
-where \(s_j=1\) for an individual observation and \(s_j\) is the number of
+where $s_j=1$ for an individual observation and $s_j$ is the number of
 individual observations in a group.
 
-For a tensor, the last dimension must equal \(N_{\text{expected}}`. The
+For a tensor, the last dimension must equal $N_{\text{expected}}$. The
 tensor is split along that dimension while preserving the declared output
 order:
 
 $$
-\text{chunks}
-=
-\operatorname{split}
-\left(
-\text{output},
-(s_1,\ldots,s_n),
-\text{dim}=-1
-\right)
+\mathrm{chunks} = \mathrm{split}\left(\mathrm{output}, (s_1,\ldots,s_n), \mathrm{dim}=-1\right)
 $$
 
-For a tuple or list, its length must equal \(N_{\text{expected}}\), and
+For a tuple or list, its length must equal $N_{\text{expected}}$, and
 consecutive slices are assigned to the declared output names. A
 mapping/dictionary is not accepted when multiple outputs are declared.
 
