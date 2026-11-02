@@ -517,7 +517,7 @@ retrieves its layer from the graph navigator:
 
 $$
 \text{state\_id} =
-\operatorname{index}(\text{state\_name},\text{states\_list}) + 1
+\mathrm{index}(\text{state\_name},\text{states\_list}) + 1
 $$
 
 The common arguments passed to the world model are `state`, `state_id`,
@@ -557,9 +557,9 @@ The width represented by a distribution is derived from its `event_shape`:
 $$
 w(d) =
 \begin{cases}
-1 & \text{if } \operatorname{event\_shape}(d)=() \\
+1 & \text{if } \mathrm{event\_shape}(d)=() \\
 \displaystyle\prod_{k=1}^{m}s_k
-& \text{if } \operatorname{event\_shape}(d)=(s_1,\ldots,s_m)
+& \text{if } \mathrm{event\_shape}(d)=(s_1,\ldots,s_m)
 \end{cases}
 $$
 
@@ -569,7 +569,7 @@ Consequently, a scalar `Normal` contributes one column, whereas a
 ### Output-shape calculation
 
 For each observational child, preprocessing contributes the shape
-\((1,n_o)\), where \(n_o\) is the number of individual observations
+$(1,n_o)$, where $n_o$ is the number of individual observations
 represented by that child.
 
 For each hierarchical child, it retrieves the child's distributions from
@@ -579,11 +579,11 @@ identical widths.
 
 Action children do not contribute to the output dimensions.
 
-If the contributing child shapes are \((R_1,C_1),\ldots,(R_n,C_n)\), all row
+If the contributing child shapes are $(R_1,C_1),\ldots,(R_n,C_n)$, all row
 counts must be equal. The resulting dimensions are:
 
 $$
-\operatorname{output\_shape}
+\mathrm{output\_shape}
 =
 \left(R,\sum_{i=1}^{n}C_i\right),
 \qquad R_1=\cdots=R_n=R
