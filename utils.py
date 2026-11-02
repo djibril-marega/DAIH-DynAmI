@@ -98,3 +98,6 @@ def get_keys_none(observation):
             if value is None:
                 keys.append(key)
     return keys
+
+def dict_keys_to_list(d: dict) -> list:
+    return list(d.keys())

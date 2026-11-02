@@ -1,11 +1,11 @@
 import model_components, utils
-import torch
+import torch, math
 from collections.abc import Mapping
 
-def preprocessing_layer_for_free_energy(state_name, navigator, functions_map, inputs_map, Q_, pi_priors, pi_obs, observations):
+def preprocessing_layer_for_free_energy(state_name, navigator, functions_map, inputs_map, Q_, pi_priors, pi_obs, observations, states_list):
     # 2. Update state by state
     #  - state_prior = output of function f for the state (must have the same size as Q)
-    state_prior = model_components.get_transition_prediction(navigator, functions_map, inputs_map, state_name)
+    state_prior = model_components.get_transition_prediction(navigator, functions_map, inputs_map, state_name, states_list, Q_)
     #  - state_posterior = Q of the function
     state_posterior = inputs_map[state_name]
     #  - D_posterior = shifted Q (takes Q, removes the first element, and replaces the last one with 0)
@@ -15,7 +15,7 @@ def preprocessing_layer_for_free_energy(state_name, navigator, functions_map, in
     #  - actual = posterior of child states or observations
     actual = model_components.get_actual(navigator, Q_, state_name, observations)
     # - prediction: prediction of g
-    prediction = model_components.get_state_prediction(navigator, functions_map, inputs_map, state_name)
+    prediction = model_components.get_state_prediction(navigator, functions_map, inputs_map, state_name, states_list, Q_)
     #print("prediction: ", prediction)
     #  - pi_obs = precision of function g
     pi_obs_t = model_components.get_actual_precision(navigator, pi_obs, Q_, state_name)
@@ -79,10 +79,12 @@ def get_one_hot_action_parents(action_one_hot, actions_id, navigator):
 
     return state_parents, action_name
 
-def preprocessing_for_excepted_free_energy(all_action_of_state, action_name, parent_of_action, local_inputs_map, pi_priors, navigator, functions_map, Q_):
+def preprocessing_for_excepted_free_energy(
+        all_action_of_state, action_name, parent_of_action, local_inputs_map, pi_priors, navigator, functions_map, Q_, states_list
+    ):
     f_action_inputs = actions_vectors_for_f(all_action_of_state, action_name, navigator)
     local_inputs_map |= f_action_inputs
-    temporal_pred = model_components.get_transition_prediction(navigator, functions_map, local_inputs_map, parent_of_action, recursive_input=None)
+    temporal_pred = model_components.get_transition_prediction(navigator, functions_map, local_inputs_map, parent_of_action, states_list, Q_, policy=True)
     outputs_f = navigator.output_f(parent_of_action)
     if len(outputs_f) == 1:
         local_inputs_map[outputs_f[0]] = temporal_pred
@@ -90,7 +92,7 @@ def preprocessing_for_excepted_free_energy(all_action_of_state, action_name, par
         for output_f in outputs_f:
             local_inputs_map[output_f] = temporal_pred
 
-    transition_cost = model_components.get_transition_cost(navigator, functions_map, local_inputs_map, parent_of_action)
+    transition_cost = model_components.get_transition_cost(navigator, functions_map, local_inputs_map, parent_of_action, states_list, Q_)
     pi_priors = pi_priors[parent_of_action]
 
     list_co_variances = []
@@ -133,18 +135,24 @@ def prepare_inputs(input_names, inputs_map):
     return {name: inputs_map[name] for name in input_names}
 
 
-def map_outputs(output_names, output):
-    """
-    Map function return values to graph-declared output names.
 
-    A single declared output receives the whole returned object, even if that
-    object is a list, matrix, tensor, or nested structure. Multiple positional
-    outputs must be returned as a tuple/list. Mapping outputs are matched by
-    name and returned in graph-declared order.
+def map_outputs(output_names, output, navigator):
     """
+    Map function outputs to graph-declared output names.
+
+    Rules:
+        - One output: considered as a state, returned unchanged.
+        - Multiple outputs: each name must represent either an
+          individual observation or an observation group.
+        - Groups are expanded according to their observations.
+        - Output order is preserved.
+        - Tensor splitting is performed along the last dimension.
+    """
+
     output_names = list(output_names)
     n_outputs = len(output_names)
 
+    # No outputs
     if n_outputs == 0:
         if output is not None:
             raise ValueError(
@@ -153,48 +161,88 @@ def map_outputs(output_names, output):
             )
         return {}
 
+    # Single output: state
     if n_outputs == 1:
-        name = output_names[0]
-        if isinstance(output, Mapping):
-            if name not in output:
-                raise KeyError(
-                    f"Output '{name}' is missing from the returned dictionary."
-                )
-            if len(output) != 1:
-                raise ValueError(
-                    f"Only one output is declared ({name}), but "
-                    "multiple named outputs are returned."
-                )
-            return {name: output[name]}
-        return {name: output}
+        return {
+            output_names[0]: output
+        }
 
+    # Multiple outputs
     if isinstance(output, Mapping):
-        missing = [name for name in output_names if name not in output]
-        extra = [name for name in output if name not in output_names]
-        if missing or extra:
-            raise ValueError(
-                "Outputs are incompatible with the graph. "
-                f"Missing: {missing}. Unexpected: {extra}."
-            )
-        return {name: output[name] for name in output_names}
+        raise TypeError(
+            "Multiple outputs must be returned as a Tensor, "
+            "tuple or list."
+        )
 
-    if isinstance(output, (tuple, list)):
-        if len(output) != n_outputs:
-            raise ValueError(
-                f"The function returns {len(output)} objects, but the graph "
-                f"declares {n_outputs} outputs: {output_names}."
-            )
-        return dict(zip(output_names, output))
+    output_sizes = {}
 
-    raise TypeError(
-        f"The function must return a tuple, a list, or a dictionary "
-        f"to map {n_outputs} outputs: {output_names}. "
-        f"Received type: {type(output).__name__}."
-    )
+    for name in output_names:
+
+        # Check whether the name is an individual observation.
+        if (
+            name in navigator.graph
+            and navigator.graph[name].get("type") == "observation"
+        ):
+            output_sizes[name] = 1
+
+        else:
+            # Otherwise, interpret the name as an observation group.
+            observations = navigator.get_observations_by_group(name)
+
+            if not observations:
+                raise KeyError(
+                    f"'{name}' is neither an individual observation "
+                    "nor a valid observation group."
+                )
+
+            output_sizes[name] = len(observations)
+
+    # Total number of observations expected.
+    expected_size = sum(output_sizes.values())
+
+    # Split Tensor along its last dimension.
+    if isinstance(output, torch.Tensor):
+
+        if output.shape[-1] != expected_size:
+            raise ValueError(
+                f"The output tensor contains {output.shape[-1]} "
+                f"elements along its last dimension, but "
+                f"{expected_size} were expected."
+            )
+
+        chunks = torch.split(
+            output,
+            list(output_sizes.values()),
+            dim=-1
+        )
+
+    # Split list or tuple.
+    elif isinstance(output, (tuple, list)):
+
+        if len(output) != expected_size:
+            raise ValueError(
+                f"The function returns {len(output)} elements, "
+                f"but {expected_size} were expected."
+            )
+
+        chunks = []
+        index = 0
+
+        for size in output_sizes.values():
+            chunks.append(output[index:index + size])
+            index += size
+
+    else:
+        raise TypeError(
+            f"Unsupported output type: {type(output).__name__}."
+        )
+
+    return dict(zip(output_names, chunks))
+
 
 
 def execute_named_function(
-    navigator, functions_map, inputs_map, state, function_name
+    navigator, functions_map, inputs_map, state, function_name, states_list, function_type, Q_
 ):
     """Execute f/g/p/V and return {declared_output_name: returned_object}."""
     function_ref = navigator.function(state, function_name)
@@ -210,9 +258,13 @@ def execute_named_function(
     function = functions_map[function_ref]
     input_names = get_io_names(navigator, state, function_name, "input")
     output_names = get_io_names(navigator, state, function_name, "output")
-    kwargs = prepare_inputs(input_names, inputs_map)
+    #kwargs = prepare_inputs(input_names, inputs_map)
+    kwargs = prepare_world_model_inputs(navigator, input_names, inputs_map, state, states_list, function_type, Q_)
     result = function(**kwargs)
-    return map_outputs(output_names, result)
+    if function_type != "p":
+        return map_outputs(output_names, result.values, navigator)
+    else:
+        return result
 
 
 def get_io_names(navigator, state, function_name, direction):
@@ -272,7 +324,7 @@ def flatten_named_outputs(named_outputs):
 
 
 def execute_flat_function(
-    navigator, functions_map, inputs_map, state, function_name
+    navigator, functions_map, inputs_map, state, function_name, states_list, function_type, Q_
 ):
     """
     Execute f/g/p/V and return a single 1D vector.
@@ -281,6 +333,238 @@ def execute_flat_function(
     then each output is flattened and concatenated in output_* order.
     """
     named_outputs = execute_named_function(
-        navigator, functions_map, inputs_map, state, function_name
+        navigator, functions_map, inputs_map, state, function_name, states_list, function_type, Q_
     )
     return flatten_named_outputs(named_outputs)
+
+
+
+def get_distribution_width(distribution):
+    """
+    Determines the number of columns represented by a distribution.
+
+    Normal            -> 1 column
+    MultivariateNormal -> number of dimensions of event_shape
+    """
+    event_shape = distribution.event_shape
+
+    if len(event_shape) == 0:
+        return 1
+
+    return math.prod(event_shape)
+
+
+
+def get_output_shape(navigator, state_name, Q_):
+    """
+    Determines the output shape based on the children of the current state.
+
+    - observation : one observation = one column.
+    - hierarchy : dimensions are determined from Q_.
+    - action : ignored in dimension calculations.
+
+    Observational and hierarchical connections
+    can coexist.
+    """
+
+    children = navigator.children(state_name)
+
+    if not children:
+        raise ValueError(
+            f"State '{state_name}' has no children."
+        )
+
+    # Separate children based on their connection type.
+    observation_children = [
+        child for child in children
+        if child["connection"] == "observation"
+    ]
+
+    hierarchy_children = [
+        child for child in children
+        if child["connection"] == "hierarchy"
+    ]
+
+    action_children = [
+        child for child in children
+        if child["connection"] == "action"
+    ]
+
+    # Check for unknown connections.
+    known_connections = {"observation", "hierarchy", "action"}
+
+    unknown_connections = {
+        child["connection"]
+        for child in children
+        if child["connection"] not in known_connections
+    }
+
+    if unknown_connections:
+        raise ValueError(
+            f"Unknown connections for '{state_name}': "
+            f"{unknown_connections}"
+        )
+
+    # Actions do not contribute to the output shape.
+    child_shapes = []
+
+    # Observational children: one column per observation.
+    if observation_children:
+        child_shapes.append((1, len(observation_children)))
+
+    # Hierarchical children: dimensions retrieved from Q_.
+    for child in hierarchy_children:
+
+        child_state = child["node"]
+
+        if child_state not in Q_:
+            raise KeyError(
+                f"Child state '{child_state}' is missing from Q_."
+            )
+
+        distributions = Q_[child_state]
+
+        if not distributions:
+            raise ValueError(
+                f"No distribution found for '{child_state}'."
+            )
+
+        rows = len(distributions)
+        cols = get_distribution_width(distributions[0])
+
+        # Check width consistency.
+        for distribution in distributions[1:]:
+            width = get_distribution_width(distribution)
+
+            if width != cols:
+                raise ValueError(
+                    f"Incompatible dimensions in Q_['{child_state}']."
+                )
+
+        child_shapes.append((rows, cols))
+
+    if not child_shapes:
+        raise ValueError(
+            f"State '{state_name}' has no observational "
+            "or hierarchical children to determine "
+            "its shape."
+        )
+
+    # All children contributing to the output must have
+    # the same number of rows.
+    rows = child_shapes[0][0]
+
+    if any(shape[0] != rows for shape in child_shapes):
+        raise ValueError(
+            f"Children of '{state_name}' "
+            "do not have the same number of rows."
+        )
+
+    # Concatenate columns.
+    cols = sum(shape[1] for shape in child_shapes)
+
+    return (rows, cols)
+
+
+
+
+def prepare_world_model_inputs(
+    navigator,
+    input_names,
+    inputs_map,
+    state_name,
+    states_list,
+    function_type,
+    Q_,
+):
+    """
+    Prepares arguments intended for WorldModel.forward().
+
+    WorldModel conventions are independent
+    of the input names declared in the graph.
+
+    Actions can be:
+        - An individual action.
+        - An action group.
+    """
+
+    # Current state
+    if state_name not in inputs_map:
+        raise KeyError(
+            f"State '{state_name}' is missing from inputs_map."
+        )
+
+    state = inputs_map[state_name]
+
+    # State identifier
+    try:
+        state_id = states_list.index(state_name)+1
+    except ValueError:
+        raise ValueError(
+            f"State '{state_name}' is missing from states_list."
+        )
+
+    # Layer identifier
+    layer_id = navigator.get_state_layer(state_name)
+
+    kwargs = {
+        "state": state,
+        "state_id": state_id,
+        "layer_id": layer_id,
+        "function_type": function_type,
+    }
+
+    # Search for individual actions and action groups.
+    detected_actions = []
+
+    for name in input_names:
+
+        # Individual action
+        is_individual_action = (
+            name in navigator.graph
+            and navigator.graph[name].get("type") == "action"
+        )
+
+        # Action group
+        actions_in_group = navigator.get_actions_by_group(name)
+        is_action_group = bool(actions_in_group)
+
+        if is_individual_action or is_action_group:
+
+            if name not in inputs_map:
+                raise KeyError(
+                    f"Action or action group '{name}' "
+                    "is missing from inputs_map."
+                )
+
+            detected_actions.append(name)
+
+    # WorldModel accepts only a single action or a single group.
+    if len(detected_actions) > 1:
+        raise ValueError(
+            "WorldModel.forward() accepts only a single action, "
+            f"but multiple were detected: {detected_actions}"
+        )
+
+    if detected_actions:
+        action_name = detected_actions[0]
+        kwargs["action"] = inputs_map[action_name]
+
+    # Optional parameters
+    for parameter in ("max_steps", "deterministic"):
+        if parameter in input_names and parameter in inputs_map:
+            kwargs[parameter] = inputs_map[parameter]
+
+    # Output dimensions for g and V only.
+    if function_type == "g":
+        kwargs["output_shape"] =  get_output_shape(
+            navigator,
+            state_name,
+            Q_,
+        )
+    elif function_type == "V":
+        kwargs["output_shape"] =  (1, 1)
+    elif function_type == "p":
+        kwargs["temperature"] = inputs_map[f"error_{state_name}"]
+
+    return kwargs

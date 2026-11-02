@@ -24,12 +24,17 @@ class Agent_DAIH():
         self.pi_obs_substitued = {}
 
         self.max_policies_iter = 100
+
+        self.lr_motors = 1
+        self.lr_policies = 1
+        self.lr_obs = 1
     
     
     def model(self, generative_functions=None, functions_map=None, observations=None, actions=None, pi_p=None):
         states = model.validate_model(self.D, generative_functions, actions)
         _, idx_to_actions = model.actions_index(actions)
         self.actions_id = idx_to_actions
+        self.states_list = utils.dict_keys_to_list(self.D)
 
         (
             self.mu,
@@ -94,7 +99,7 @@ class Agent_DAIH():
                 prepared = preprocessing.preprocessing_layer_for_free_energy(state_name, 
                                                             self.navigator, self.functions_map, self.inputs_map, 
                                                             self.Q_, self.pi_priors, 
-                                                            self.pi_obs, observations
+                                                            self.pi_obs, observations, self.states_list
                                                             )
                 gamma_obs = torch.log(prepared["pi_obs"]).requires_grad_(True)
                 
@@ -109,23 +114,21 @@ class Agent_DAIH():
                         gamma_obs,
                         prepared["prediction"].requires_grad_(True),
                     )
-                # pi obs for calculate lr
-                pi_obs_for_lr = prepared["pi_obs"]
 
                 # command motors
-                motors = self.motor_command(state_name, F, prepared["prediction"], pi_obs_for_lr)
+                motors = self.motor_command(state_name, F, prepared["prediction"])
 
                 # mean update
                 new_posterior = inference.euler_update(prepared["state_posterior"], 0.1, F)
 
                 # Π_obs update
-                self.pi_obs = inference.update_pi_obs(self.navigator, self.pi_obs, gamma_obs, F, self.Q_, state_name, pi_obs_for_lr, 
-                                                      dt=0.1, iter=1
+                self.pi_obs = inference.update_pi_obs(self.navigator, self.pi_obs, gamma_obs, F, self.Q_, state_name, 
+                                                      dt=0.1, lr_obs=self.lr_obs
                                                     )
 
                 # covariance update
                 new_precision_hessian = inference.second_derivative_F(prepared["state_posterior"], F)
-
+                #print("new_precision_hessian : ", new_precision_hessian)
                 # update beliefs
                 Q = inference.update_distributions(new_precision_hessian.detach(), new_posterior.detach(), self.Q_[state_name], eps=1e-6)
                 self.Q_[state_name] = Q
@@ -161,8 +164,8 @@ class Agent_DAIH():
             return torch.sum(gaussian_entropy-log_prior_precision)
         
         def risk(variances, transition_cost):
-            entropy_gaussian_excepted = 0.5*torch.log(2*torch.pi*torch.e*(variances ** 2))
-            return torch.sum(entropy_gaussian_excepted - transition_cost)
+            log_det = torch.logdet(2 * torch.pi * torch.e * variances)
+            return torch.sum(0.5 * log_det - transition_cost)
 
         return excepted_ambiguity(pi_priors) + risk(variances, transition_cost)
     
@@ -176,15 +179,19 @@ class Agent_DAIH():
                     f"Policy selection exceeded the limit of {self.max_policies_iter} "
                     f"iterations. Interrupted to prevent an infinite loop."
                 )
-
-            policies_candidats = model_components.get_policy_candidates(self.navigator, self.functions_map, self.inputs_map)
+            #print("self.inputs_map : ", self.inputs_map)
+            policies_candidats = model_components.get_policy_candidates(self.navigator, self.functions_map, self.inputs_map, self.states_list, self.Q_)
             admited_candidats = []
+            #print("policies_candidats: ", policies_candidats["life_expectancy"])
             is_policy_finded = False
-            for state_name, policy in policies_candidats.items():
+            for state_name, policy_values in policies_candidats.items():
                 local_Q_ = copy.deepcopy(self.Q_)
                 local_inputs_map = copy.deepcopy(self.inputs_map)
 
-                for action_t in policy[0]:
+                for action_t in policy_values.policy.policy[0]:
+                    #print("action_t : ", action_t)
+                    if torch.sum(action_t) != 1:
+                        break
                     # get all state that depends on this one-hot action "action_t"
                     state_parents, action_name = preprocessing.get_one_hot_action_parents(action_t, self.actions_id, self.navigator)
 
@@ -200,35 +207,40 @@ class Agent_DAIH():
                         local_inputs_map[parent_of_action].requires_grad_(True)
                         # get all actions vectors for "parent_of_action" function f inputs
                         prepared = preprocessing.preprocessing_for_excepted_free_energy(all_action_of_state, action_name, parent_of_action, 
-                                                                                        local_inputs_map,
-                                                                            self.pi_priors, self.navigator, self.functions_map, local_Q_)
+                                                                                        local_inputs_map, self.pi_priors, self.navigator, 
+                                                                                        self.functions_map, local_Q_, self.states_list
+                                                                            )
 
 
                         G_posterior = self.execepted_free_energy(prepared["pi_priors"], prepared["co_variances"], prepared["transition_cost"])
 
                         # belief projected update
-                        new_precision = inference.jacobian_from_output(prepared["temporal_pred"], local_inputs_map[parent_of_action])
+                        new_precision = inference.seconde_derivative_from_output(prepared["temporal_pred"], local_inputs_map[parent_of_action])
                         Q = inference.update_distributions(new_precision.detach(), prepared["temporal_pred"].detach(), local_Q_[parent_of_action], eps=1e-6)
                         local_Q_[parent_of_action] = Q
 
+
                 # compare G_prior to G_posterior
-                G_prior = policy[1]
+                G_prior = policy_values.policy.G
+                #print("G_prior: ", G_prior)
+                #print("G_posterior: ", G_posterior)
                 try:
                     pi_p = self.pi_p[state_name].requires_grad_(True)
+                    #print("pi_p: ", pi_p)
                     error_eps = inference.policy_error(G_prior, G_posterior, pi_p)
+                    #print("error_eps: ", error_eps)
 
                     if error_eps <= 1:
-                        fist_action = policy[0][0]
+                        fist_action = policy_values.policy.policy[0][0]
                         admited_candidats.append([fist_action, G_posterior])
                     else: 
-                        self.inputs_map[f"error_{state_name}"] = error_eps.detach()
+                        self.inputs_map[f"error_{state_name}"] = torch.log(torch.tensor(1+1e-7+error_eps.detach().item()))
                 except UnboundLocalError:
                     pass
 
             # Update Π_P
             try:
-                lr = inference.get_lr(pi_p, i)
-                next_pi_p = utils.update_wih_grad_desc(pi_p, error_eps, dt=0.1, k=lr)
+                next_pi_p = utils.update_wih_grad_desc(pi_p, error_eps, dt=0.1, k=self.lr_policies)
                 self.pi_p[state_name] = torch.clamp(next_pi_p, min=1e-9, max=1e+6).detach()
             except UnboundLocalError:
                 print("None policies")
@@ -243,16 +255,21 @@ class Agent_DAIH():
             if is_policy_finded:
                 action_group, new_action_oh = inference.update_current_action(best_candidat, self.actions_id, self.navigator)
                 self.inputs_map[action_group[0]] = new_action_oh
-                self.inputs_map[f"error_{state_name}"] = self.pi_p[state_name].detach()
-                
-                return  {"action": action_name,
+                self.inputs_map[f"error_{state_name}"] = self.pi_p[state_name].detach().item()
+
+                # get first action name
+                a_one_hot = policy_values.policy.policy[0][0] # fist action one-hot
+                #print("a_one_hot: ", a_one_hot)
+                #print("self.actions_id: ", self.actions_id)
+                _, first_action_name = preprocessing.get_one_hot_action_parents(a_one_hot, self.actions_id, self.navigator)
+
+                return  {"action": first_action_name, # fist action name
                             "G_prior": G_prior,
                             "G_posterior": G_posterior.detach().item()
                         }
 
     
-    def motor_command(self, current_state, F, g_output, pi_obs):
-        lr = inference.get_lr(pi_obs)
+    def motor_command(self, current_state, F, g_output):
         states = self.navigator.states_with_motors()
 
         if current_state not in states:
@@ -272,7 +289,7 @@ class Agent_DAIH():
             return {}
 
         # Descente de gradient sur le vecteur complet grad descente on complet output_g
-        new_y = utils.update_wih_grad_desc(g_output, F, dt=0.1, k=lr)
+        new_y = utils.update_wih_grad_desc(g_output, F, dt=0.1, k=self.lr_motors)
 
         # Keep only the envolved motors
         return {
