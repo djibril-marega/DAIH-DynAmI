@@ -22,6 +22,7 @@ than exhaustively exploring every possible policy.
 -   [Objectives](#objectives)
 -   [Model Principles](#model-principles)
 -   [Software Architecture](#software-architecture)
+-   [Preprocessing and Output Mapping](#preprocessing-and-output-mapping)
 -   [Inference and Belief Updating](#inference-and-belief-updating)
 -   [Policy Selection](#policy-selection)
 -   [Reflex Motor Control](#reflex-motor-control)
@@ -51,9 +52,6 @@ The project explores an agent architecture based on the following ideas:
     policy and compare its expected score with its reevaluated score.
 6.  **Fast motor control:** adjust motor outputs using gradient descent
     on variational free energy.
-7.  **Dynamic learning rates:** adapt update speed according to
-    observation precision during perceptual inference and according to
-    policy precision and iteration count during policy selection.
 
 The design hypothesis is that an agent operating in a dynamic
 environment must be able to make decisions on time and with limited
@@ -188,6 +186,156 @@ In the current implementation, `inference(observations)` first handles
 missing observations, then runs `beliefs_update(observations)`, yields
 any motor commands, and proceeds to policy selection where applicable.
 
+## Preprocessing and Output Mapping
+
+The preprocessing layer bridges the graph representation and the
+`WorldModel.forward()` interface. It prepares the current state, its
+identifiers, the function type, optional action information, and any
+function-specific parameters.
+
+### Preparing WorldModel inputs
+
+`prepare_world_model_inputs(...)` builds a keyword-argument dictionary. The
+state must exist in `inputs_map`, and its identifier is obtained from its
+position in `states_list`:
+
+$$
+\text{state\_id} = \operatorname{index}(\text{state\_name}) + 1
+$$
+
+The layer identifier is obtained from
+`navigator.get_state_layer(state_name)`. The common arguments are:
+
+-   `state`: current state value from `inputs_map`;
+-   `state_id`: one-based position of the state in `states_list`;
+-   `layer_id`: layer returned by the graph navigator;
+-   `function_type`: one of the model function types.
+
+Actions are detected from the declared `input_names`. A name is treated as
+an action when it is an individual action node or an action group recognized
+by `navigator.get_actions_by_group(...)`. The corresponding value must
+exist in `inputs_map`.
+
+`WorldModel.forward()` accepts at most one action argument: either one
+individual action or one action group. If more than one action or group is
+detected, preprocessing raises an error. The action value is passed under
+the `action` keyword.
+
+The optional parameters `max_steps` and `deterministic` are forwarded only
+when they are declared in `input_names` and are present in `inputs_map`.
+
+Function-specific arguments are prepared as follows:
+
+  -----------------------------------------------------------------------
+  Function type   Additional argument
+  -------------   -------------------------------------------------------
+  `g`             `output_shape`, calculated from observational and
+                  hierarchical children of the state
+  `V`             `output_shape = (1, 1)`
+  `p`             `temperature`, read from
+                  `inputs_map[f"error_{state_name}"]`
+  `f`             No additional argument is added by this preprocessing
+                  function
+  -----------------------------------------------------------------------
+
+### Computing output dimensions
+
+`get_distribution_width(distribution)` determines how many columns a
+distribution represents. A scalar `Normal` distribution has an empty
+`event_shape` and therefore represents one column. A multivariate
+distribution uses the product of its event dimensions:
+
+$$
+w(d) =
+\begin{cases}
+1 & \text{if } \operatorname{event\_shape}(d) = () \\
+\displaystyle\prod_{k=1}^{m} s_k
+& \text{if } \operatorname{event\_shape}(d) = (s_1,\ldots,s_m)
+\end{cases}
+$$
+
+The product is implemented with `math.prod(event_shape)`.
+
+`get_output_shape(...)` examines the children of the current state and
+separates them by connection type:
+
+-   **Observation children:** contribute one row and one column per
+    individual observation. For \(n_o\) observations, their shape is
+    \((1,n_o)\).
+-   **Hierarchy children:** their distributions are retrieved from `Q_`.
+    The number of distributions determines the row count, and the event
+    shape of the first distribution determines the column count. All
+    distributions belonging to that child must have the same width.
+-   **Action children:** are ignored when calculating the output shape.
+
+Let the contributing child shapes be \((R_1,C_1),\ldots,(R_n,C_n)\). They
+must all have the same row count \(R\). The resulting shape concatenates
+their columns:
+
+$$
+\operatorname{output\_shape}
+=
+\left(R,\sum_{i=1}^{n} C_i\right)
+$$
+
+An error is raised when the state has no children, no observational or
+hierarchical child contributes to the dimensions, a referenced child is
+missing from `Q_`, distributions have inconsistent widths, or the
+contributing children have different row counts.
+
+This means observational and hierarchical children can coexist, but their
+row counts must be compatible. In particular, an observation contribution
+has one row, so it can coexist with a hierarchical contribution only when
+that contribution also has one row.
+
+### Mapping function outputs
+
+`map_outputs(output_names, output, navigator)` maps a function result to the
+names declared in the graph.
+
+-   With no declared output names, the function must return `None`;
+    otherwise an error is raised.
+-   With exactly one output name, the complete returned object is mapped
+    to that name unchanged. This is the state-output convention.
+-   With multiple output names, every name must identify either an
+    individual observation or an observation group. Groups are expanded
+    according to the number of individual observations they contain.
+
+For multiple outputs, the expected number of observation values is:
+
+$$
+N_{\text{expected}} = \sum_{j=1}^{n} s_j
+$$
+
+where \(s_j=1\) for an individual observation and \(s_j\) is the number of
+individual observations in a group.
+
+For a tensor, the last dimension must equal \(N_{\text{expected}}`. The
+tensor is split along that dimension while preserving the declared output
+order:
+
+$$
+\text{chunks}
+=
+\operatorname{split}
+\left(
+\text{output},
+(s_1,\ldots,s_n),
+\text{dim}=-1
+\right)
+$$
+
+For a tuple or list, its length must equal \(N_{\text{expected}}\), and
+consecutive slices are assigned to the declared output names. A
+mapping/dictionary is not accepted when multiple outputs are declared.
+
+Unsupported output types, unknown observation names, and size mismatches
+raise explicit errors.
+
+The resulting dictionary maps each declared output name to its corresponding
+tensor chunk or sequence slice. The order of names in `output_names` is
+therefore significant.
+
 ## Inference and Belief Updating
 
 ### Variational free energy $F$
@@ -241,41 +389,6 @@ with a numerical substitute and temporarily lowers its precision so that
 the placeholder has negligible influence. When the observation becomes
 available again, its saved precision is restored. See the configuration
 and model-definition guides for the relevant data conventions.
-
-### Dynamic learning rate
-
-The current implementation defines a shared learning-rate helper:
-
-``` python
-def get_lr(precision, iter=1):
-    return precision * iter
-```
-
-For perceptual precision updates, the learning rate is derived from the
-precision supplied by the caller. The intended relationship is:
-
-$$
-lr^{(i)} \propto \Pi_{\text{obs}}^{(i)}
-$$
-
-A high observation precision therefore produces a larger update step,
-whereas a low precision produces a smaller step. The aim is to adapt
-assimilation speed to the reliability represented by the precision. The
-exact behavior depends on the precision passed to `get_lr(...)` by the
-update path.
-
-The observation-precision update uses this rate when applying gradient
-descent to `gamma_obs`:
-
-``` python
-lr = get_lr(pi_of_g)
-new_gamma_obs = utils.update_wih_grad_desc(
-    gamma_obs, F, dt=dt, k=lr
-)
-```
-
-The relationship above describes the intended perceptual rule; it does
-not by itself guarantee stable updates or prevent overfitting.
 
 ### Precisions and distributions
 
@@ -360,39 +473,6 @@ and a selection among accepted candidates. A bounded retry strategy and
 the behavior when no candidate is accepted remain important validation
 points.
 
-### Dynamic learning rate for policy selection
-
-Policy selection uses both the relevant precision and the iteration
-count to calculate the learning rate:
-
-$$
-lr^{(i)} \propto \Pi_p^{(i)} \times \mathrm{iter}
-$$
-
-In the current code, this rate is passed to the gradient-descent update
-of `pi_p`:
-
-``` python
-lr = inference.get_lr(pi_p, i)
-next_pi_p = utils.update_wih_grad_desc(
-    pi_p, error_eps, dt=0.1, k=lr
-)
-```
-
-This couples the update magnitude to the policy precision and the number
-of iterations. As iterations increase, the learning rate can increase
-as well, potentially accelerating a decision when deliberation takes
-too long. However, the rate is not bounded by `get_lr(...)`; large
-iteration counts or precision values may produce excessively large
-steps. The resulting behavior must be evaluated experimentally.
-
-The intended hypothesis is that increasing update magnitude may create
-oscillations in policy evaluation and eventually break prolonged
-hesitation, forcing a choice before precision collapses. This is an
-intended mechanism, not a guaranteed consequence of the formula; the
-onset of oscillations, the behavior of $\Pi_p$, and whether a policy is
-ultimately selected must be verified in tests.
-
 ### Learning during wakefulness and sleep
 
 The proposed architecture distinguishes two modes:
@@ -418,18 +498,10 @@ $$
 y_{\text{new}} = y_{\text{pred}} - \Delta t \, k \, \frac{\partial F}{\partial y_{\text{pred}}}
 $$
 
-In the current code, `motor_command(...)` obtains its step size through
-`inference.get_lr(pi_obs)` and passes it to
-`utils.update_wih_grad_desc(g_output, F, dt=0.1, k=lr)`. Since the
-iteration argument is omitted, `get_lr(...)` uses its default value of
-`iter=1`. The method then returns only the components associated with
-the motors of the relevant state.
-
-Consequently, motor-update magnitude depends on the precision value
-passed by this call. The step size, time step, and stopping criteria are
-important parameters for control stability and speed; the precise type
-and meaning of `pi_obs` at this call site should be checked against the
-implementation.
+The motor update uses the step size supplied to the gradient-descent
+operation. The time step and update coefficient therefore determine the
+magnitude of each adjustment. Their values must be evaluated for control
+stability and convergence.
 
 ## Model Configuration
 
@@ -567,20 +639,8 @@ following:
     entries are initialized for all observations used by inference,
     remain positive, and are not unintentionally overwritten during
     precision updates.
--   **Dynamic learning-rate stability:** `get_lr(precision, iter=1)`
-    multiplies precision by the iteration count without minimum or
-    maximum bounds. Verify that precision values are valid and that
-    iteration-dependent steps do not cause numerical divergence.
--   **Policy-selection dynamics:** test whether increasing the learning
-    rate actually produces the intended oscillations and decision
-    behavior; neither a precision collapse nor a forced selection follows
-    automatically from the formula.
--   **Learning-rate call sites:** verify the value and shape passed as
-    `precision` in perceptual, policy, and motor updates, and confirm
-    that each call uses the intended precision.
--   **Unused parameters:** verify iteration, learning-rate, and
-    tolerance attributes before assuming they effectively control
-    execution.
+-   **Unused parameters:** verify iteration and tolerance attributes
+    before assuming they effectively control execution.
 
 ## Roadmap
 
@@ -643,4 +703,3 @@ inference:
 **DAIH-DynAmI**: an experimental hybrid active inference prototype
 exploring coordination between generalized beliefs, amortized policy
 generation, and reflex motor control.
- 

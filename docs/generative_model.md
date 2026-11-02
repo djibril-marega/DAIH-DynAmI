@@ -118,8 +118,12 @@ child. There is no requirement that layers be consecutive: a parent in
 layer 5 can be linked to a child in layer 1 if that relationship is
 declared.
 
-A state may have multiple parents, and a parent state may have multiple
-children. Two states in the same layer are not linked automatically.
+A state may have multiple parents. Under the intended model convention,
+a state should have at most one hierarchical state child, while it may
+have several observation children. This is a modeling constraint: the
+current `get_output_shape()` helper iterates over all hierarchical
+children but does not enforce this cardinality rule. Two states in the
+same layer are not linked automatically.
 
 ### `layer`: temporal organization of updates
 
@@ -531,7 +535,85 @@ The supplied code does not check whether the hierarchical graph is
 acyclic. If an acyclic hierarchy is required, this validation must be
 added separately.
 
-## 12. Recommended Procedure for Adding a State
+## 12. Mapping Function Outputs to Declared Names
+
+The output names declared in a function are resolved by
+`map_outputs(output_names, output, navigator)`.
+
+### No output and single output
+
+If `output_names` is empty, the function must return `None`. Returning a
+value when no output is declared raises an error.
+
+If exactly one output name is declared, the complete returned object is
+assigned to that name without splitting. This is the state-output
+convention:
+
+``` python
+{
+    output_names[0]: output
+}
+```
+
+### Multiple observation outputs
+
+When several output names are declared, each name must represent either:
+
+-   an individual observation node;
+-   an observation group containing individual observation names.
+
+Action names, state names, and unknown group names are not accepted as
+multiple observation outputs by this mapping rule.
+
+An individual observation contributes one value. An observation group
+contributes as many values as it contains individual observations. If the
+corresponding sizes are \(s_1,\ldots,s_n\), the expected total is:
+
+$$
+N_{\text{expected}} = \sum_{j=1}^{n}s_j
+$$
+
+### Tensor outputs
+
+For a `torch.Tensor`, the last dimension must have exactly
+\(N_{\text{expected}}\) elements. The tensor is split along its last
+dimension:
+
+$$
+\text{chunks}
+=
+\operatorname{torch.split}
+\left(
+\text{output},
+(s_1,\ldots,s_n),
+\text{dim}=-1
+\right)
+$$
+
+This preserves the other dimensions of the tensor and the order of
+`output_names`.
+
+### Tuple and list outputs
+
+For a tuple or list, its length must equal \(N_{\text{expected}}\).
+Consecutive slices are then assigned to each declared output name according
+to its size.
+
+For example, if the declared outputs are one individual observation
+followed by a group of two observations, the sequence is partitioned into
+slices of lengths \(1\) and \(2\).
+
+### Errors and return structure
+
+A mapping/dictionary is rejected when multiple output names are declared.
+Unsupported output types, unknown observation names, and mismatches between
+the returned size and the expected size raise explicit errors.
+
+The returned object is a dictionary whose keys preserve the declared output
+names and whose values contain the corresponding tensor chunks or list/tuple
+slices. Output declaration order therefore determines the mapping order.
+
+## 13. Recommended Procedure for Adding a State
 
 1.  Choose a unique name.
 2.  Define `layer` according to the expected temporal regime.
@@ -547,7 +629,7 @@ added separately.
 10. Check the special constraints for motors.
 11. Build the graph and fix any validation errors.
 
-## Summary
+## 14. Summary
 
 -   `parents` defines the explicit hierarchy.
 -   `layer` describes the expected temporal update level; the scheduling
@@ -563,7 +645,6 @@ added separately.
 -   Missing observations are handled during inference by substituting a
     numeric placeholder and temporarily lowering precision; this does
     not change graph structure.
--   `a` is no longer used.
 -   The derivative convention must be reconciled explicitly with the
     shape expected by `make_distributions()`.
 

@@ -2,7 +2,7 @@ from torch.func import jacrev
 import preprocessing
 import torch
 
-def get_state_prediction(navigator, functions_map, inputs_map, state, Jacobian=None):
+def get_state_prediction(navigator, functions_map, inputs_map, state, states_list, Q_, Jacobian=None):
     """
     Computes the prediction g of a state as a flattened vector.
 
@@ -19,7 +19,7 @@ def get_state_prediction(navigator, functions_map, inputs_map, state, Jacobian=N
 
     def flattened_g(inputs):
         return preprocessing.execute_flat_function(
-            navigator, functions_map, inputs, state, "g"
+            navigator, functions_map, inputs, state, "g", states_list, "g", Q_
         )
 
     predictions = flattened_g(dict_inputs)
@@ -78,8 +78,6 @@ def get_actual(navigator, Q_, state, observations):
 
         # 2. Child corresponding to an observation
         elif node_type == "observation":
-            #print("child_node:", child_node)
-            #print("observations:", observations)
 
             # Find the category containing this observation
             observation_key = next(
@@ -238,26 +236,11 @@ def get_actual_precision(navigator, pi_obs, Q_, state):
 
     return torch.cat(precision_values)
 
-        
-
-
-
-def get_futur_state_reward(navigator, functions_map, inputs_map, state):
-    """
-    Executes V and returns a 1D vector, with outputs flattened
-    and concatenated in the order declared by output_V.
-    """
-    if navigator.function(state, "V") is None:
-        return None
-
-    return preprocessing.execute_flat_function(
-        navigator, functions_map, inputs_map, state, "V"
-    )
 
 
 def get_transition_prediction(
-    navigator, functions_map, inputs_map, state, recursive_input=None
-):
+    navigator, functions_map, inputs_map, state, states_list, Q_, recursive_input=None, policy=None
+): 
     """
     Executes f and returns a 1D vector, with outputs flattened
     and concatenated in the order declared by output_f.
@@ -280,12 +263,17 @@ def get_transition_prediction(
     if navigator.function(state, "f") is None:
         return None
 
-    return preprocessing.execute_flat_function(
-        navigator, functions_map, local_inputs, state, "f"
-    )
+    if policy:
+        return next(iter(preprocessing.execute_named_function(
+                navigator, functions_map, local_inputs, state, "f", states_list, "f", Q_
+            ).values()))
+    else:
+        return preprocessing.execute_flat_function(
+            navigator, functions_map, local_inputs, state, "f", states_list, "f", Q_
+        )
 
 
-def get_policy_candidates(navigator, functions_map, inputs_map):
+def get_policy_candidates(navigator, functions_map, inputs_map, state_list, Q_):
     policy_candidates = {}
 
     for state, node in navigator.graph.items():
@@ -294,16 +282,17 @@ def get_policy_candidates(navigator, functions_map, inputs_map):
         if navigator.function(state, "p") is None:
             continue
 
+        #print("statestate state: ", state)
         outputs = preprocessing.execute_named_function(
-            navigator, functions_map, inputs_map, state, "p"
+            navigator, functions_map, inputs_map, state, "p", state_list, "p", Q_
         )
 
-        policy_candidates[state] = next(iter(outputs.values()))
+        policy_candidates[state] = outputs
 
     return policy_candidates
 
 
-def get_transition_cost(navigator, functions_map, inputs_map, state):
+def get_transition_cost(navigator, functions_map, inputs_map, state, states_list, Q_):
     """
     Executes V and returns a 1D vector, with outputs flattened
     and concatenated in the order declared by output_V.
@@ -313,5 +302,5 @@ def get_transition_cost(navigator, functions_map, inputs_map, state):
         return None
 
     return preprocessing.execute_flat_function(
-        navigator, functions_map, inputs_map, state, "V"
+        navigator, functions_map, inputs_map, state, "V", states_list, "V", Q_
     )

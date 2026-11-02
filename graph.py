@@ -1,4 +1,3 @@
-
 class GraphNavigator:
 
     def __init__(self, graph):
@@ -382,6 +381,9 @@ class GraphNavigator:
             if node.get("type") == "state"
             and node.get("layer") is not None
         })
+
+    def get_state_layer(self, state_name):
+        return self.get(state_name, "layer")
 
     
     # =========================================================

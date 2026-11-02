@@ -504,7 +504,107 @@ The graph:
 
 Group names do not become nodes.
 
-## 12. Initialization Example
+## 12. Preprocessing and WorldModel Input Dimensions
+
+The preprocessing layer converts graph metadata and current values into the
+arguments expected by `WorldModel.forward()`.
+
+### Common arguments
+
+For a state named `state_name`, preprocessing retrieves its value from
+`inputs_map`, computes its one-based identifier from `states_list`, and
+retrieves its layer from the graph navigator:
+
+$$
+\text{state\_id} =
+\operatorname{index}(\text{state\_name},\text{states\_list}) + 1
+$$
+
+The common arguments passed to the world model are `state`, `state_id`,
+`layer_id`, and `function_type`.
+
+### Action inputs
+
+An input name is recognized as an action when it is either an individual
+action node or an action group. Its value must be present in `inputs_map`.
+
+The world model accepts only one action argument per call: one individual
+action or one action group. Declaring more than one detected action input
+raises an error.
+
+The optional values `max_steps` and `deterministic` are forwarded only when
+they appear in the function's declared input names and are present in
+`inputs_map`.
+
+### Function-specific arguments
+
+  -----------------------------------------------------------------------
+  Function type   Preprocessing rule
+  -------------   -------------------------------------------------------
+  `g`             Computes `output_shape` from observational and
+                  hierarchical children
+  `V`             Uses `output_shape = (1, 1)`
+  `p`             Reads `temperature` from
+                  `inputs_map[f"error_{state_name}"]`
+  `f`             Adds no function-specific argument in this preprocessing
+                  function
+  -----------------------------------------------------------------------
+
+### Distribution width
+
+The width represented by a distribution is derived from its `event_shape`:
+
+$$
+w(d) =
+\begin{cases}
+1 & \text{if } \operatorname{event\_shape}(d)=() \\
+\displaystyle\prod_{k=1}^{m}s_k
+& \text{if } \operatorname{event\_shape}(d)=(s_1,\ldots,s_m)
+\end{cases}
+$$
+
+Consequently, a scalar `Normal` contributes one column, whereas a
+`MultivariateNormal` contributes the product of its event dimensions.
+
+### Output-shape calculation
+
+For each observational child, preprocessing contributes the shape
+\((1,n_o)\), where \(n_o\) is the number of individual observations
+represented by that child.
+
+For each hierarchical child, it retrieves the child's distributions from
+`Q_`. The number of distributions is the row count, and the distribution
+width is the column count. All distributions for the same child must have
+identical widths.
+
+Action children do not contribute to the output dimensions.
+
+If the contributing child shapes are \((R_1,C_1),\ldots,(R_n,C_n)\), all row
+counts must be equal. The resulting dimensions are:
+
+$$
+\operatorname{output\_shape}
+=
+\left(R,\sum_{i=1}^{n}C_i\right),
+\qquad R_1=\cdots=R_n=R
+$$
+
+Observational and hierarchical children may coexist only when their row
+counts are compatible. Since observational children contribute one row, a
+hierarchical contribution with more than one row cannot be concatenated with
+them by this rule.
+
+The helper raises an error if there are no children, if no observation or
+hierarchy child contributes dimensions, if a hierarchical child is absent
+from `Q_`, if its distribution list is empty, if distribution widths
+disagree, or if contributing row counts differ.
+
+The current preprocessing implementation loops over all hierarchical
+children. The intended graph convention may restrict a state to at most one
+hierarchical state child while permitting several observation children; that
+cardinality rule is not enforced by this shape helper.
+
+## 13. Initialization Example
 
 ``` python
 actions = {
@@ -572,7 +672,7 @@ print(q_position[0].sample())
 Here, `mu = [[0, 0]]` creates one multivariate distribution of dimension
 2.
 
-## 13. Validation Errors and Limitations
+## 14. Validation Errors and Limitations
 
 According to the supplied code, `validate_model()` may report:
 
@@ -615,7 +715,7 @@ Limitations to keep in mind:
     original precision can be backed up and restored by individual
     observation name.
 
-## 14. Key Rules to Remember
+## 15. Key Rules to Remember
 
 1.  Every state in `generative_functions` must have a corresponding
     entry in `D`.
