@@ -1,5 +1,5 @@
 import torch
-import utils, model, preprocessing, inference, model_components
+from . import utils, model, preprocessing, inference, model_components
 import math, copy
 
 # Deep Active Inference Hybride Framework with Dynamic Planning Horizon and Amortized Active Inference (DAIH-DynAmI)

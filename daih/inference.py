@@ -1,6 +1,6 @@
 import torch
 import torch.distributions as dist
-import utils
+from . import utils
 import copy
 
 def euler_update(mu, dt, F_value):

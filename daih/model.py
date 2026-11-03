@@ -1,6 +1,6 @@
 import torch
 import torch.distributions as dist
-import graph 
+from . import graph 
 
 
 def sum_priors(pi_priors, navigator):

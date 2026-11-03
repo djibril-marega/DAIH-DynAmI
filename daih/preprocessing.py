@@ -1,4 +1,4 @@
-import model_components, utils
+from . import model_components, utils
 import torch, math
 from collections.abc import Mapping
 
