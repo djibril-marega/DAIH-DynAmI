@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "daih"
+version = "0.1.0"
+description = "Deep Active Inference Hybride Framework with Dynamic Planning Horizon and Amortized Active Inference"
+readme = "README.md"
+requires-python = ">=3.8"
+dependencies = [
+    # Ajoutez vos dépendances ici si nécessaire, par exemple :
+    # "numpy>=1.20",
+    # "requests",
+]
+
+[tool.setuptools]
+packages = ["daih"]
