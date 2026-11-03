@@ -17,7 +17,7 @@ from typing import Callable, Dict, Optional, Tuple, Union
 import torch
 from torch import nn
 
-from policy_generator import PolicyGenerator, PolicyOutput
+from .policy_generator import PolicyGenerator, PolicyOutput
 
 
 FunctionType = str

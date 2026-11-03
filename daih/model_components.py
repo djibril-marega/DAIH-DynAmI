@@ -1,5 +1,5 @@
 from torch.func import jacrev
-import preprocessing
+from . import preprocessing
 import torch
 
 def get_state_prediction(navigator, functions_map, inputs_map, state, states_list, Q_, Jacobian=None):
