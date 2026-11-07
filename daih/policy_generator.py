@@ -328,7 +328,7 @@ class PolicyGenerator(nn.Module):
         final_scores = torch.cat(step_scores, dim=1)
 
         # Compute G (expected total return or target)
-        total_return = final_scores.sum(dim=1)
+        total_return = final_scores.sum()
 
         return PolicyOutput(
             policy=final_policy,
