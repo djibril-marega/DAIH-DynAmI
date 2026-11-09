@@ -140,13 +140,15 @@ def map_outputs(output_names, output, navigator):
     """
     Map function outputs to graph-declared output names.
 
+    WorldModel has already consumed any local masks before this function
+    receives the result. This function only associates final output matrices
+    with their graph-declared names.
+
     Rules:
-        - One output: considered as a state, returned unchanged.
-        - Multiple outputs: each name must represent either an
-          individual observation or an observation group.
-        - Groups are expanded according to their observations.
-        - Output order is preserved.
-        - Tensor splitting is performed along the last dimension.
+        - One output: returned unchanged.
+        - Multi-output form: one final matrix per declared name.
+        - Output order follows output_names.
+        - Legacy flat tensors are still split across observation outputs.
     """
 
     output_names = list(output_names)
@@ -167,12 +169,20 @@ def map_outputs(output_names, output, navigator):
             output_names[0]: output
         }
 
-    # Multiple outputs
+    # Multiple outputs: one final matrix per declared name. Any local masks
+    # have already been consumed by WorldModel.
     if isinstance(output, Mapping):
-        raise TypeError(
-            "Multiple outputs must be returned as a Tensor, "
-            "tuple or list."
-        )
+        missing = [name for name in output_names if name not in output]
+        extra = [name for name in output if name not in output_names]
+        if missing or extra:
+            raise ValueError(
+                f"Returned output mapping does not match output_names; "
+                f"missing={missing}, extra={extra}."
+            )
+        return {name: output[name] for name in output_names}
+
+    if isinstance(output, (tuple, list)) and len(output) == n_outputs:
+        return dict(zip(output_names, output))
 
     output_sizes = {}
 
@@ -259,7 +269,10 @@ def execute_named_function(
     input_names = get_io_names(navigator, state, function_name, "input")
     output_names = get_io_names(navigator, state, function_name, "output")
     #kwargs = prepare_inputs(input_names, inputs_map)
-    kwargs = prepare_world_model_inputs(navigator, input_names, inputs_map, state, states_list, function_type, Q_)
+    kwargs = prepare_world_model_inputs(
+        navigator, input_names, inputs_map, state, states_list,
+        function_type, Q_, output_names=output_names
+    )
     result = function(**kwargs)
     if function_type != "p":
         return map_outputs(output_names, result.values, navigator)
@@ -318,7 +331,9 @@ def flatten_named_outputs(named_outputs):
     if not named_outputs:
         return torch.empty(0, dtype=torch.float32)
 
-    values = [as_flat_tensor(value) for value in named_outputs.values()]
+    values = []
+    for value in named_outputs.values():
+        values.append(as_flat_tensor(value))
     return torch.cat(values) if len(values) > 1 else values[0]
 
 
@@ -329,8 +344,9 @@ def execute_flat_function(
     """
     Execute f/g/p/V and return a single 1D vector.
 
-    Outputs are first associated with the names declared in the graph,
-    then each output is flattened and concatenated in output_* order.
+    WorldModel returns final matrices only. Outputs are associated with the
+    names declared in the graph, then flattened and concatenated in output_*
+    order.
     """
     named_outputs = execute_named_function(
         navigator, functions_map, inputs_map, state, function_name, states_list, function_type, Q_
@@ -468,6 +484,54 @@ def get_output_shape(navigator, state_name, Q_):
 
 
 
+def get_named_output_shapes(navigator, output_names, Q_):
+    """
+    Return one (rows, columns) shape per declared output name, in graph order.
+
+    A state uses the dimensions of its Q_ distributions. An individual
+    observation uses one cell, and an observation group uses one cell per
+    observation in that group.
+    """
+    shapes = []
+
+    for name in output_names:
+        node = navigator.graph.get(name)
+        node_type = node.get("type") if node is not None else None
+
+        if node_type == "state":
+            if name not in Q_:
+                raise KeyError(
+                    f"Output state '{name}' is missing from Q_."
+                )
+            distributions = Q_[name]
+            if not distributions:
+                raise ValueError(
+                    f"No distributions found in Q_['{name}']."
+                )
+            width = get_distribution_width(distributions[0])
+            for distribution in distributions[1:]:
+                if get_distribution_width(distribution) != width:
+                    raise ValueError(
+                        f"Incompatible dimensions in Q_['{name}']."
+                    )
+            shapes.append((len(distributions), width))
+            continue
+
+        if node_type == "observation":
+            shapes.append((1, 1))
+            continue
+
+        observations = navigator.get_observations_by_group(name)
+        if not observations:
+            raise KeyError(
+                f"Output '{name}' is neither a state, an individual "
+                "observation, nor a valid observation group."
+            )
+        shapes.append((1, len(observations)))
+
+    return tuple(shapes)
+
+
 def prepare_world_model_inputs(
     navigator,
     input_names,
@@ -476,6 +540,7 @@ def prepare_world_model_inputs(
     states_list,
     function_type,
     Q_,
+    output_names=None,
 ):
     """
     Prepares arguments intended for WorldModel.forward().
@@ -555,13 +620,15 @@ def prepare_world_model_inputs(
         if parameter in input_names and parameter in inputs_map:
             kwargs[parameter] = inputs_map[parameter]
 
-    # Output dimensions for g and V only.
+    # g outputs are shaped independently, in the exact order declared by
+    # output_g. Keep output_shape for single-output compatibility.
     if function_type == "g":
-        kwargs["output_shape"] =  get_output_shape(
-            navigator,
-            state_name,
-            Q_,
-        )
+        if output_names is None:
+            output_names = get_io_names(navigator, state_name, "g", "output")
+        output_shapes = get_named_output_shapes(navigator, output_names, Q_)
+        kwargs["output_shapes"] = output_shapes
+        if len(output_shapes) == 1:
+            kwargs["output_shape"] = output_shapes[0]
     elif function_type == "V":
         kwargs["output_shape"] =  (1, 1)
     elif function_type == "p":

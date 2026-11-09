@@ -12,7 +12,7 @@ Local functions are user-defined Python callables.
 They are neither trained nor registered in state_dict().
 """
 from dataclasses import dataclass
-from typing import Callable, Dict, Optional, Tuple, Union
+from typing import Any, Callable, Dict, Optional, Tuple, Union
 
 import torch
 from torch import nn
@@ -21,13 +21,13 @@ from .policy_generator import PolicyGenerator, PolicyOutput
 
 
 FunctionType = str
-LocalFunction = Callable[..., Union[torch.Tensor, PolicyOutput, tuple]]
+LocalFunction = Callable[..., Union[torch.Tensor, PolicyOutput, tuple, list]]
 
 
 @dataclass
 class WorldModelOutput:
     function_type: str
-    values: Optional[torch.Tensor] = None
+    values: Optional[Any] = None
     policy: Optional[PolicyOutput] = None
     used_local_function: bool = False
     state_id: Optional[int] = None
@@ -303,17 +303,19 @@ class WorldModel(nn.Module):
         action: Optional[torch.Tensor] = None,
         temperature: Optional[float] = None,
         output_shape: Optional[Tuple[int, int]] = None,
+        output_shapes: Optional[Tuple[Tuple[int, int], ...]] = None,
         max_steps: int = 20,
         deterministic: Optional[bool] = None,
     ) -> WorldModelOutput:
         """
-        Executes a local function and completes its output according to a mask.
+        Executes local functions and completes masked values with neural predictions.
 
-        For f/g/V, a local function returns values or (values, mask).
-        mask=1 keeps the local value; mask=0 requests a neural prediction.
-        Without a mask, all positions are considered controlled.
-        The local callable receives only the current state, never the global latent.
-        Type p retains its policy generation interface.
+        For f/V and single-output g, a local function may return values or
+        (values, mask). For multi-output g, it returns one such item per
+        declared output, in output_shapes order. Masks are consumed internally:
+        this method exposes only the final value matrix/matrices. mask=1 keeps
+        the local value; mask=0 requests a neural prediction. Type p retains
+        its policy interface.
         """
         self._type_index(function_type)
         x, original_2d = self._as_batch(state)
@@ -421,6 +423,124 @@ class WorldModel(nn.Module):
                 )
 
 
+            # g may declare several independently-shaped outputs. Each item
+            # is either a matrix or a (matrix, binary_mask) pair.
+            if function_type == "g" and output_shapes is not None:
+                shapes = tuple(tuple(map(int, shape)) for shape in output_shapes)
+                if not shapes:
+                    raise ValueError("output_shapes cannot be empty for g.")
+
+                if len(shapes) == 1:
+                    # Backward compatibility: one output may be returned as
+                    # a matrix, or as (matrix, mask).
+                    output_items = [local_result]
+                    if isinstance(local_result, (tuple, list)) and len(local_result) == 1:
+                        output_items = [local_result[0]]
+                elif isinstance(local_result, (tuple, list)) and len(local_result) == len(shapes):
+                    output_items = list(local_result)
+                elif isinstance(local_result, torch.Tensor):
+                    # Legacy multi-output tensor: split its columns when all
+                    # outputs share the same row count.
+                    if len({shape[0] for shape in shapes}) != 1:
+                        raise ValueError(
+                            "A single tensor cannot represent g outputs with "
+                            "different row counts; return one matrix per output."
+                        )
+                    expected_cols = sum(shape[1] for shape in shapes)
+                    if local_result.shape[-1] != expected_cols:
+                        raise ValueError(
+                            f"Legacy g tensor has {local_result.shape[-1]} columns; "
+                            f"{expected_cols} are required by output_shapes."
+                        )
+                    output_items = list(torch.split(
+                        local_result, [shape[1] for shape in shapes], dim=-1
+                    ))
+                else:
+                    raise ValueError(
+                        f"g declares {len(shapes)} outputs; the local function "
+                        "must return one item per output."
+                    )
+
+                merged_outputs = []
+                for index, (item, expected_shape) in enumerate(zip(output_items, shapes)):
+                    if isinstance(item, tuple) and len(item) == 2:
+                        local_values, local_mask = item
+                    else:
+                        local_values, local_mask = item, None
+
+                    values = torch.as_tensor(local_values, device=x.device, dtype=x.dtype)
+                    if values.dim() == 2:
+                        values = values.unsqueeze(0)
+                    if values.dim() != 3 or tuple(values.shape[-2:]) != expected_shape:
+                        raise ValueError(
+                            f"Local g output #{index} must have shape [R,C] or [B,R,C] "
+                            f"with spatial shape {expected_shape}; received {tuple(values.shape)}."
+                        )
+                    if values.shape[0] not in (1, x.shape[0]):
+                        raise ValueError(
+                            "The batch size of each local g output must be 1 "
+                            "or equal to that of state."
+                        )
+                    if values.shape[0] == 1 and x.shape[0] > 1:
+                        values = values.expand(x.shape[0], -1, -1)
+
+                    if local_mask is None:
+                        mask = torch.ones_like(values)
+                    else:
+                        mask = torch.as_tensor(local_mask, device=x.device, dtype=x.dtype)
+                        if mask.dim() == 2:
+                            mask = mask.unsqueeze(0)
+                        try:
+                            mask = torch.broadcast_to(mask, values.shape)
+                        except RuntimeError as exc:
+                            raise ValueError(
+                                f"Mask for g output #{index} must be broadcastable "
+                                f"to {tuple(values.shape)}; received {tuple(mask.shape)}."
+                            ) from exc
+                        if not bool(torch.all((mask == 0) | (mask == 1))):
+                            raise ValueError("Local masks must be binary (0 or 1).")
+
+                    if bool(torch.all(mask == 1)):
+                        merged = values
+                    else:
+                        context = self.encode_context(x, state_id, layer_id, function_type)
+                        flat_local = values.reshape(values.shape[0], -1)
+                        local_stats = torch.stack(
+                            [
+                                flat_local.mean(dim=1),
+                                flat_local.std(dim=1, unbiased=False),
+                                flat_local.amin(dim=1),
+                                flat_local.amax(dim=1),
+                                torch.full_like(flat_local[:, 0], float(values.shape[1])).log1p(),
+                                torch.full_like(flat_local[:, 0], float(values.shape[2])).log1p(),
+                                mask.reshape(mask.shape[0], -1).mean(dim=1),
+                            ],
+                            dim=1,
+                        )
+                        fused_context = self.local_fusion(
+                            torch.cat([context, local_stats], dim=1)
+                        )
+                        predicted = self._predict_gv(
+                            fused_context, expected_shape, values, mask
+                        )
+                        merged = mask * values + (1.0 - mask) * predicted
+
+                    # The mask is an internal mechanism: only the merged
+                    # matrix is exposed by WorldModel.
+                    merged = self._restore_batch(merged, original_2d)
+                    merged_outputs.append(merged)
+
+                output_values = (
+                    merged_outputs[0] if len(merged_outputs) == 1
+                    else tuple(merged_outputs)
+                )
+                return WorldModelOutput(
+                    function_type="g", values=output_values, used_local_function=True,
+                    state_id=int(state_id), layer_id=int(layer_id)
+                )
+
+            # Original single-output path used by f and V, and by legacy g
+            # calls that do not provide output_shapes.
             if isinstance(local_result, tuple) and len(local_result) == 2:
                 local_values, local_mask = local_result
             else:
@@ -461,8 +581,6 @@ class WorldModel(nn.Module):
             if bool(torch.all(mask == 1)):
                 merged = values
             else:
-                # The network receives the state context, the local output, and
-                # the proportion of cells controlled by the local function.
                 context = self.encode_context(x, state_id, layer_id, function_type)
                 flat_local = values.reshape(values.shape[0], -1)
                 local_stats = torch.stack(
@@ -485,6 +603,8 @@ class WorldModel(nn.Module):
                 )
                 merged = mask * values + (1.0 - mask) * predicted
 
+            # Masks are consumed internally and are never part of the
+            # WorldModel public output.
             merged = self._restore_batch(merged, original_2d)
             return WorldModelOutput(
                 function_type=function_type, values=merged, used_local_function=True,
@@ -505,6 +625,15 @@ class WorldModel(nn.Module):
 
         if function_type == "f":
             values = self._predict_f(x, context)
+        elif function_type == "g" and output_shapes is not None:
+            shapes = tuple(tuple(map(int, shape)) for shape in output_shapes)
+            if not shapes:
+                raise ValueError("output_shapes cannot be empty for g.")
+            predictions = [
+                self._restore_batch(self._predict_gv(context, shape), original_2d)
+                for shape in shapes
+            ]
+            values = predictions[0] if len(predictions) == 1 else tuple(predictions)
         else:
             if output_shape is None:
                 raise ValueError(
@@ -513,7 +642,8 @@ class WorldModel(nn.Module):
                 )
             values = self._predict_gv(context, output_shape)
 
-        values = self._restore_batch(values, original_2d)
+        if not (function_type == "g" and output_shapes is not None):
+            values = self._restore_batch(values, original_2d)
         return WorldModelOutput(
             function_type=function_type, values=values, used_local_function=False,
             state_id=int(state_id), layer_id=int(layer_id)

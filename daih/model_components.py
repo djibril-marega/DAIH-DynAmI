@@ -4,11 +4,10 @@ import torch
 
 def get_state_prediction(navigator, functions_map, inputs_map, state, states_list, Q_, Jacobian=None):
     """
-    Computes the prediction g of a state as a flattened vector.
+    Computes g as a flattened numerical vector.
 
-    The association of outputs follows output_g. Flattening is performed
-    here only because this function produces a numerical vector.
-    If Jacobian=True, returns (predicted_vector, Jacobian).
+    Named outputs remain ordered by output_g. Optional masks are metadata and
+    are not concatenated into the numerical prediction vector.
     """
     g_function_name = navigator.function(state, "g")
     if g_function_name is None:
@@ -31,107 +30,85 @@ def get_state_prediction(navigator, functions_map, inputs_map, state, states_lis
     return predictions
 
 
-
-
 def get_actual(navigator, Q_, state, observations):
     """
-    Retrieves the actual values of the children of a state.
+    Retrieves actual child values in the exact order declared by output_g.
 
-    - Child of type 'state': retrieves the Q.loc values of its distributions.
-    - Child of type 'observation': retrieves its observed value.
-    - If both types exist, retrieves both.
-
-    Returns
-    -------
-    torch.Tensor
-        Vector containing the actual values of all children.
+    State outputs contribute every Q_[state].loc value.
+    Individual observations and observation groups contribute their observed
+    values in the order returned by the navigator.
     """
-
-    import torch
-
     actual = []
 
-    children = navigator.children(state)
-    for child in children:
-        child_node = child["node"]
-        node_type = navigator.type(child_node)
-        # 1. Child corresponding to a state
-        if node_type == "state":
-            if child_node not in Q_:
-                raise KeyError(
-                    f"No Q_ distribution is defined for state "
-                    f"'{child_node}'."
-                )
+    outputs_g = (
+        navigator.output_g(state)
+        if hasattr(navigator, "output_g")
+        else [child["node"] for child in navigator.children(state)]
+    )
 
-            # Q_[child_node] contains a list of distributions
-            for q in Q_[child_node]:
+    for output in outputs_g:
+        # State output
+        if output in Q_:
+            for q in Q_[output]:
                 value = q.loc
-
                 if not isinstance(value, torch.Tensor):
-                    value = torch.as_tensor(
-                        value, dtype=torch.float32
-                    )
+                    value = torch.as_tensor(value, dtype=torch.float32)
                 else:
                     value = value.to(dtype=torch.float32)
-
                 actual.append(value.reshape(-1))
+            continue
 
-        # 2. Child corresponding to an observation
-        elif node_type == "observation":
+        # Individual observation or observation group
+        try:
+            output_type = navigator.type(output)
+        except (KeyError, TypeError, AttributeError):
+            output_type = None
 
-            # Find the category containing this observation
-            observation_key = next(
-                (
-                    key
-                    for key, variables in observations.items()
-                    if isinstance(variables, dict) and child_node in variables
-                ),
-                None
+        if output_type == "observation":
+            observation_names = [output]
+        else:
+            observation_names = navigator.get_observations_by_group(output)
+
+        if not observation_names:
+            raise KeyError(
+                f"Output '{output}' declared in output_g is neither a "
+                "known state nor an observation or observation group."
             )
 
+        for observation_name in observation_names:
+            observation_key = next(
+                (
+                    key for key, variables in observations.items()
+                    if isinstance(variables, dict) and observation_name in variables
+                ),
+                None,
+            )
             if observation_key is None:
                 raise KeyError(
-                    f"Observation '{child_node}' is missing from the observations dictionary."
+                    f"Observation '{observation_name}' is missing from "
+                    "the observations dictionary."
                 )
 
-            # Retrieve the actual value
-            value = observations[observation_key][child_node]
-            # Convert to PyTorch if it is not already a tensor
+            value = observations[observation_key][observation_name]
             if not isinstance(value, torch.Tensor):
-                value = torch.as_tensor(
-                    value, dtype=torch.float32
-                )
+                value = torch.as_tensor(value, dtype=torch.float32)
             else:
                 value = value.to(dtype=torch.float32)
-            
             actual.append(value.reshape(-1))
 
-    # 3. Concatenate all values
     if not actual:
         return torch.empty(0, dtype=torch.float32)
 
     return torch.cat(actual)
 
 
-
-
 def get_actual_precision(navigator, pi_obs, Q_, state):
     """
-    Builds the precision vector following navigator.output_g(state).
+    Builds precision values in output_g order.
 
-    State outputs:
-        Inverse marginal variances from Q_.
-
-    Individual observation outputs:
-        Use pi_obs[observation], or 1 if missing.
-
-    Observation group outputs:
-        Retrieve group observations and use their individual
-        precisions from pi_obs, or 1 if missing.
-
-    Unknown outputs are ignored.
+    State outputs use inverse marginal variances from Q_. Individual
+    observations and observation groups use pi_obs, defaulting to 1.
     """
-
     dtype = torch.float32
     device = torch.device("cpu")
     precision_values = []
@@ -139,34 +116,22 @@ def get_actual_precision(navigator, pi_obs, Q_, state):
     outputs_g = navigator.output_g(state)
 
     for output in outputs_g:
-
-        # --------------------------------------------------
-        # 1. State output
-        # --------------------------------------------------
         if output in Q_:
-
             for q in Q_[output]:
-
                 if hasattr(q, "covariance_matrix"):
                     covariance = torch.as_tensor(
-                        q.covariance_matrix,
-                        dtype=dtype,
-                        device=device
+                        q.covariance_matrix, dtype=dtype, device=device
                     )
-
-                    if covariance.ndim <= 1:
-                        variances = covariance.reshape(-1)
-                    else:
-                        variances = torch.diagonal(covariance)
-
+                    variances = (
+                        covariance.reshape(-1)
+                        if covariance.ndim <= 1
+                        else torch.diagonal(covariance)
+                    )
                 elif hasattr(q, "scale"):
                     scale = torch.as_tensor(
-                        q.scale,
-                        dtype=dtype,
-                        device=device
+                        q.scale, dtype=dtype, device=device
                     )
                     variances = scale.square().reshape(-1)
-
                 else:
                     raise TypeError(
                         f"Cannot retrieve variances for '{output}'."
@@ -176,77 +141,50 @@ def get_actual_precision(navigator, pi_obs, Q_, state):
                     raise ValueError(
                         f"Variances for '{output}' must be positive."
                     )
-
-                precision_values.append(
-                    variances.reciprocal().reshape(-1)
-                )
-
+                precision_values.append(variances.reciprocal().reshape(-1))
             continue
 
-        # --------------------------------------------------
-        # 2. Individual observation
-        # --------------------------------------------------
         try:
             output_type = navigator.type(output)
         except KeyError:
             output_type = None
 
         if output_type == "observation":
-            observations = [output]
-
+            observation_names = [output]
         else:
-            # --------------------------------------------------
-            # 3. Observation group
-            # --------------------------------------------------
-            observations = navigator.get_observations_by_group(output)
+            observation_names = navigator.get_observations_by_group(output)
 
-            if not observations:
-                continue
+        if not observation_names:
+            raise KeyError(
+                f"Output '{output}' is neither a state, an observation, "
+                "nor a valid observation group."
+            )
 
-        # --------------------------------------------------
-        # 4. Retrieve each observation's precision
-        # --------------------------------------------------
-        for observation in observations:
-
+        for observation in observation_names:
             precision = (
                 pi_obs.get(observation)
                 if isinstance(pi_obs, dict)
                 else None
             )
-
             if isinstance(precision, torch.Tensor):
-                precision = precision.to(
-                    dtype=dtype,
-                    device=device
-                ).reshape(-1)
+                precision = precision.to(dtype=dtype, device=device).reshape(-1)
             else:
-                precision = torch.ones(
-                    1,
-                    dtype=dtype,
-                    device=device
-                )
-
+                precision = torch.ones(1, dtype=dtype, device=device)
             precision_values.append(precision)
 
-    # --------------------------------------------------
-    # 5. Concatenate
-    # --------------------------------------------------
     if not precision_values:
         return torch.empty(0, dtype=dtype, device=device)
 
     return torch.cat(precision_values)
 
 
-
 def get_transition_prediction(
-    navigator, functions_map, inputs_map, state, states_list, Q_, recursive_input=None, policy=None
-): 
+    navigator, functions_map, inputs_map, state, states_list, Q_,
+    recursive_input=None, policy=None
+):
     """
-    Executes f and returns a 1D vector, with outputs flattened
-    and concatenated in the order declared by output_f.
-
-    When provided, recursive_input replaces the input named after
-    the state before the arguments are prepared. inputs_map is not modified.
+    Executes f and returns a 1D vector, with outputs flattened and
+    concatenated in output_f order.
     """
     local_inputs = dict(inputs_map)
     if recursive_input is not None:
@@ -265,42 +203,36 @@ def get_transition_prediction(
 
     if policy:
         return next(iter(preprocessing.execute_named_function(
-                navigator, functions_map, local_inputs, state, "f", states_list, "f", Q_
-            ).values()))
-    else:
-        return preprocessing.execute_flat_function(
-            navigator, functions_map, local_inputs, state, "f", states_list, "f", Q_
-        )
+            navigator, functions_map, local_inputs, state, "f",
+            states_list, "f", Q_
+        ).values()))
+    return preprocessing.execute_flat_function(
+        navigator, functions_map, local_inputs, state, "f",
+        states_list, "f", Q_
+    )
 
 
 def get_policy_candidates(navigator, functions_map, inputs_map, state_list, Q_):
     policy_candidates = {}
-
     for state, node in navigator.graph.items():
         if node.get("type") != "state":
             continue
         if navigator.function(state, "p") is None:
             continue
-
-        #print("statestate state: ", state)
         outputs = preprocessing.execute_named_function(
             navigator, functions_map, inputs_map, state, "p", state_list, "p", Q_
         )
-
         policy_candidates[state] = outputs
-
     return policy_candidates
 
 
 def get_transition_cost(navigator, functions_map, inputs_map, state, states_list, Q_):
     """
-    Executes V and returns a 1D vector, with outputs flattened
-    and concatenated in the order declared by output_V.
-    Returns None if no V function is defined.
+    Executes V and returns a 1D vector, with outputs flattened and
+    concatenated in output_V order. Returns None if no V is defined.
     """
     if navigator.function(state, "V") is None:
         return None
-
     return preprocessing.execute_flat_function(
         navigator, functions_map, inputs_map, state, "V", states_list, "V", Q_
     )

@@ -102,7 +102,6 @@ class Agent_DAIH():
                                                             self.pi_obs, observations, self.states_list
                                                             )
                 gamma_obs = torch.log(prepared["pi_obs"]).requires_grad_(True)
-                
                 # Free energy calcul
                 F = self.free_energy(
                         prepared["state_prior"],
