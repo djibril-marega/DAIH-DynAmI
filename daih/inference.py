@@ -230,74 +230,46 @@ def update_distributions(hessian, posterior, Q, eps=1e-6):
 
 
 
-def update_pi_prior(pi_prior, hessian, state_name, eps=1e-6):
+def update_pi_prior(pi_states, pi_priors, hessian, state_name, eps=1e-6):
+    """Update a state's precision and propagate it to its incoming g relations.
+
+    ``pi_states[state_name]`` is the state-level precision. Every nested
+    ``pi_priors[parent][state_name]`` is then refreshed from that value.
     """
-    Updates prior precision using the diagonal of each Hessian block.
-
-    Parameters
-    ----------
-    pi_prior : dict
-        Prior precision dictionary.
-
-    hessian : torch.Tensor
-        Hessian of shape:
-            (a, b, b) : one Hessian matrix per group.
-            (N, N)    : standard Hessian.
-            (N,)      : already diagonal.
-
-    state_name : str
-        State identifier in pi_prior.
-
-    eps : float
-        Minimum allowed precision.
-
-    Returns
-    -------
-    dict
-        Updated prior precision.
-    """
-
     if eps <= 0:
         raise ValueError("eps must be strictly positive.")
+    if state_name not in pi_states:
+        raise KeyError(f"No state precision is defined for '{state_name}'.")
 
-    prior = pi_prior[state_name]
-
+    prior = pi_states[state_name]
     if hessian.ndim == 3:
-        # Hessian (a, b, b)
-        # Extract diagonal of each group Hessian
-        precision = torch.diagonal(
-            hessian,
-            dim1=-2,
-            dim2=-1
-        )
-
+        precision = torch.diagonal(hessian, dim1=-2, dim2=-1)
     elif hessian.ndim == 2:
-        # Standard Hessian (N, N)
         precision = torch.diagonal(hessian)
-
     elif hessian.ndim == 1:
-        # Already in diagonal form
         precision = hessian
-
     else:
-        raise ValueError(
-            f"Unsupported Hessian shape: {hessian.shape}"
-        )
+        raise ValueError(f"Unsupported Hessian shape: {hessian.shape}")
 
-    # Check dimension compatibility
     if precision.numel() != prior.numel():
         raise ValueError(
-            f"Incompatible dimensions: precision={precision.shape}, "
-            f"prior={prior.shape}"
+            f"Incompatible dimensions for state '{state_name}': "
+            f"Hessian precision has {precision.numel()} elements, "
+            f"but state precision has {prior.numel()}."
         )
 
-    precision = precision.reshape(prior.shape)
+    precision = precision.reshape(prior.shape).to(
+        device=prior.device, dtype=prior.dtype
+    ).clamp_min(eps).detach()
+    pi_states[state_name] = precision
 
-    # Ensure strictly positive precisions
-    pi_prior[state_name] = precision.clamp_min(eps)
+    # Update only the incoming edges of this child. No graph traversal is
+    # required during inference; the nested relation map is already built.
+    for parent_state, child_precisions in pi_priors.items():
+        if state_name in child_precisions:
+            child_precisions[state_name] = precision.clone()
 
-    return pi_prior
-
+    return pi_states, pi_priors
 
 
 def update_pi_obs(navigator, pi_obs, gamma_obs, F, Q_, state_name, dt=0.1, lr_obs=None):

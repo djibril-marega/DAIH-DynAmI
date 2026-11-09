@@ -96,11 +96,7 @@ $$
 \mu^{(i)}_{t+\Delta t} \approx \mu^{(i)}_t + \left( D\mu^{(i)}_t - \frac{\partial F}{\partial \mu^{(i)}_t} \right)\Delta t
 $$
 
-where $D\mu^{(i)}$ denotes the next derivative order. The final
-order is closed by setting its next derivative to zero. This expression
-describes the intended principle; the exact tensor shapes and their
-interpretation must remain consistent across the functions that prepare
-inputs, calculate $F$, and perform updates.
+where $D\mu^{(i)}$ denotes the internal dynamic transition function $f$ that predicts the next derivative order from the generalized state. The final derivative order is structurally closed by setting its subsequent velocity to zero. This expression formalizes the intrinsic temporal continuity of the layer; the exact tensor shapes, padding, and their spatial interpretation must remain strictly consistent across the functions that prepare inputs, calculate $F$, and perform updates.
 
 For a state with three orders, the temporal error term can be written
 as:
@@ -113,8 +109,7 @@ $$
 \end{bmatrix}
 $$
 
-where the $x_i$ represent prior outputs of the transition function `f`,
-according to the model's convention.
+where the $x_i$ elements represent the top-down target values projected from the generative function `g` of the parent layer, serving as the hierarchical prior for the current state's internal dynamics according to the model's convention.
 
 ## Software Architecture
 
@@ -339,7 +334,7 @@ formulation used by this project is:
 $$
 F(\tilde{\mu}) = \left[
 \frac{1}{2}
-(\dot{\tilde{\mu}} + D\tilde{\mu} - \tilde{\mu}_{\text{prior}})^2
+(\dot{\tilde{\mu}} + f(\tilde{\mu}) - \tilde{\mu}_{\text{prior}})^2
 \Pi_{\text{prior}}
 -\frac{1}{2}\ln|\Pi_{\text{obs}}|
 -\frac{1}{2}\ln|\Pi_{\text{prior}}|
@@ -357,7 +352,7 @@ as the model evolves.
 The main symbols are:
 
 -   $\tilde{\mu}$: generalized belief or estimated state;
--   $D\tilde{\mu}$: next generalized derivative;
+-   $f(\tilde{\mu})$: dynamic transition prediction of the next generalized derivative;
 -   $\tilde{\mu}_{\text{prior}}$: prior prediction from
     the dynamics;
 -   $\Pi_{\text{prior}}$: precision of prior beliefs;

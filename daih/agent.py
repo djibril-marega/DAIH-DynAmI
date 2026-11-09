@@ -10,6 +10,7 @@ class Agent_DAIH():
         self.pi_obs = {}
         self.covariances = None
         self.state_priors = None
+        self.pi_states = None
         self.pi_priors = None
 
         self.Q_ = None
@@ -42,21 +43,23 @@ class Agent_DAIH():
             self.covariances,
             self.state_priors,
             self.Q_,
-            self.pi_priors,
-        ) = model.init_distributions(self.D, states, self.pi_priors)
+            self.pi_states,
+        ) = model.init_distributions(self.D, states, self.pi_states)
 
         self.graph, navigator, self.functions_map = model.init_graph(self.graph, generative_functions, functions_map, observations, actions)
 
         if navigator is not None:
             self.navigator = navigator
 
+        self.pi_priors = model.init_relation_priors(self.navigator, self.pi_states)
+
         self.inputs_map = preprocessing.sync_state_inputs(self.D, self.Q_, self.inputs_map)
 
         utils.init_actions(actions, self.inputs_map)
 
-        self.pi_p, self.inputs_map = model.init_p(generative_functions, self.pi_priors,  pi_p, self.inputs_map)
+        self.pi_p, self.inputs_map = model.init_p(generative_functions, self.pi_states, pi_p, self.inputs_map)
 
-        self.pi_threshold = model.sum_priors(self.pi_priors, self.navigator)
+        self.pi_threshold = model.sum_priors(self.pi_states, self.navigator)
 
 
 
@@ -102,11 +105,12 @@ class Agent_DAIH():
                                                             self.pi_obs, observations, self.states_list
                                                             )
                 gamma_obs = torch.log(prepared["pi_obs"]).requires_grad_(True)
+                
                 # Free energy calcul
                 F = self.free_energy(
                         prepared["state_prior"],
                         prepared["state_posterior"].requires_grad_(True),
-                        prepared["D_posterior"],
+                        prepared["f_transition"],
                         prepared["pi_prior"].requires_grad_(True),
                         prepared["actual"],
                         prepared["pi_obs"],
@@ -124,16 +128,21 @@ class Agent_DAIH():
                 self.pi_obs = inference.update_pi_obs(self.navigator, self.pi_obs, gamma_obs, F, self.Q_, state_name, 
                                                       dt=0.1, lr_obs=self.lr_obs
                                                     )
+                # re-init original size
+                new_posterior_init_size = new_posterior.reshape(prepared["state_posterior_init_size"].shape)
+                state_posterior_init_size = prepared["state_posterior"].reshape(prepared["state_posterior_init_size"].shape)
 
                 # covariance update
-                new_precision_hessian = inference.second_derivative_F(prepared["state_posterior"], F)
-                #print("new_precision_hessian : ", new_precision_hessian)
+                new_precision_hessian = inference.second_derivative_F(state_posterior_init_size, F)
+
                 # update beliefs
-                Q = inference.update_distributions(new_precision_hessian.detach(), new_posterior.detach(), self.Q_[state_name], eps=1e-6)
+                Q = inference.update_distributions(new_precision_hessian.detach(), new_posterior_init_size.detach(), self.Q_[state_name], eps=1e-6)
                 self.Q_[state_name] = Q
 
                 # Π_prior update
-                inference.update_pi_prior(self.pi_priors, new_precision_hessian, state_name, eps=1e-6)
+                inference.update_pi_prior(self.pi_states, self.pi_priors, new_precision_hessian, state_name, eps=1e-6)
+                if f"pi_{state_name}" in self.inputs_map:
+                    self.inputs_map[f"pi_{state_name}"] = self.pi_states[state_name]
 
                 # F layer
                 F_layer_list.append(F)
@@ -206,7 +215,7 @@ class Agent_DAIH():
                         local_inputs_map[parent_of_action].requires_grad_(True)
                         # get all actions vectors for "parent_of_action" function f inputs
                         prepared = preprocessing.preprocessing_for_excepted_free_energy(all_action_of_state, action_name, parent_of_action, 
-                                                                                        local_inputs_map, self.pi_priors, self.navigator, 
+                                                                                        local_inputs_map, self.pi_states, self.navigator, 
                                                                                         self.functions_map, local_Q_, self.states_list
                                                                             )
 

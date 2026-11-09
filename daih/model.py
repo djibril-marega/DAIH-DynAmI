@@ -3,16 +3,16 @@ import torch.distributions as dist
 from . import graph 
 
 
-def sum_priors(pi_priors, navigator):
+def sum_priors(pi_states, navigator):
     dict_sum_per_layer = {}
 
     for layer in navigator.layers():
         states_of_layer = navigator.states_by_layer(layer)
 
         total = sum(
-            pi_priors[state].sum()
+            pi_states[state].sum()
             for state in states_of_layer
-            if state in pi_priors
+            if state in pi_states
         )
 
         dict_sum_per_layer[layer] = total
@@ -366,7 +366,7 @@ def inverse_variance(value):
     return result
 
 
-def init_distributions(D, states, pi_priors=None):
+def init_distributions(D, states, pi_states=None):
     """Initializes distributions and state parameters."""
 
     mu_dict = {}
@@ -375,7 +375,7 @@ def init_distributions(D, states, pi_priors=None):
     state_priors = {}
     Q_ = {}
 
-    pi_priors = {} if pi_priors is None else dict(pi_priors)
+    pi_states = {} if pi_states is None else dict(pi_states)
 
     for state_name in states:
 
@@ -435,11 +435,26 @@ def init_distributions(D, states, pi_priors=None):
         state_priors[state_name] = mu_t
 
         # Initialize priors if not provided
-        if state_name not in pi_priors:
-            pi_priors[state_name] = torch.as_tensor(
+        if state_name not in pi_states:
+            pi_states[state_name] = torch.as_tensor(
                 inverse_variance(variance_t),
                 dtype=torch.float32,
             )
+        else:
+            pi_state = torch.as_tensor(
+                pi_states[state_name], dtype=torch.float32
+            )
+            if pi_state.numel() != variance_t.numel():
+                raise ValueError(
+                    f"State precision for '{state_name}' contains "
+                    f"{pi_state.numel()} elements, expected {variance_t.numel()}."
+                )
+            if not torch.isfinite(pi_state).all() or (pi_state <= 0).any():
+                raise ValueError(
+                    f"State precision for '{state_name}' must contain only "
+                    "finite, strictly positive values."
+                )
+            pi_states[state_name] = pi_state.reshape(variance_t.shape)
 
     return (
         mu_dict,
@@ -447,8 +462,32 @@ def init_distributions(D, states, pi_priors=None):
         covariances,
         state_priors,
         Q_,
-        pi_priors,
+        pi_states,
     )
+
+
+def init_relation_priors(navigator, pi_states):
+    """Initialize one precision tensor for each declared parent -> child g relation.
+
+    A relation precision has the shape of the child state's precision. Each
+    relation owns a clone, so it can evolve independently in future versions.
+    """
+    relation_priors = {parent: {} for parent in pi_states}
+
+    for child_state in pi_states:
+        for parent_state in navigator.parent_nodes(child_state, node_type="state"):
+            if navigator.function(parent_state, "g") is None:
+                continue
+
+            outputs = navigator.output_g(parent_state)
+            if child_state not in outputs:
+                continue
+
+            relation_priors.setdefault(parent_state, {})[child_state] = (
+                pi_states[child_state].detach().clone()
+            )
+
+    return relation_priors
 
 
 def init_observations(states, pi_obs=None):
@@ -489,7 +528,7 @@ def init_graph(current_graph, generative_functions, functions_map, observations,
 
 
 
-def init_p(generative_functions, pi_priors, pi_p=None, inputs_map=None):
+def init_p(generative_functions, pi_states, pi_p=None, inputs_map=None):
     """Initializes the precision and error of p functions."""
 
     pi_p = {} if pi_p is None else dict(pi_p)
@@ -507,7 +546,7 @@ def init_p(generative_functions, pi_priors, pi_p=None, inputs_map=None):
         # Initialize the inputs associated with this state
         inputs_map[f"pi_p_{state_name}"] = precision
         inputs_map[f"error_{state_name}"] = precision
-        inputs_map[f"pi_{state_name}"] = pi_priors[state_name]
+        inputs_map[f"pi_{state_name}"] = pi_states[state_name]
 
     return pi_p, inputs_map
 

@@ -3,33 +3,40 @@ import torch, math
 from collections.abc import Mapping
 
 def preprocessing_layer_for_free_energy(state_name, navigator, functions_map, inputs_map, Q_, pi_priors, pi_obs, observations, states_list):
-    # 2. Update state by state
-    #  - state_prior = output of function f for the state (must have the same size as Q)
-    state_prior = model_components.get_transition_prediction(navigator, functions_map, inputs_map, state_name, states_list, Q_)
-    #  - state_posterior = Q of the function
-    state_posterior = inputs_map[state_name]
-    #  - D_posterior = shifted Q (takes Q, removes the first element, and replaces the last one with 0)
-    D_posterior = utils.decaler(state_posterior, dim=0)
-    #  - pi_prior = inverse of the covariance of Q (here Q uses standard deviations; they must be squared to obtain the inverse)
-    pi_prior = pi_priors[state_name]
-    #  - actual = posterior of child states or observations
-    actual = model_components.get_actual(navigator, Q_, state_name, observations)
-    # - prediction: prediction of g
-    prediction = model_components.get_state_prediction(navigator, functions_map, inputs_map, state_name, states_list, Q_)
-    #print("prediction: ", prediction)
-    #  - pi_obs = precision of function g
-    pi_obs_t = model_components.get_actual_precision(navigator, pi_obs, Q_, state_name)
+    """Prepare the quantities required for the variational free energy."""
+    state_prior = model_components.get_parent_g_predictions(
+        navigator, functions_map, inputs_map, state_name, states_list, Q_
+    )
+    f_transition = model_components.get_transition_prediction(
+        navigator, functions_map, inputs_map, state_name, states_list, Q_
+    ).reshape(1, -1)
 
-    # Reshape prior
-    state_prior_original = state_prior.reshape_as(state_posterior)
-    return  {
-        "state_prior": state_prior_original,
+    state_posterior = inputs_map[state_name].reshape(1, -1)
+    pi_prior = model_components.get_parent_g_precisions(
+        navigator, state_name, pi_priors, Q_
+    )
+
+    actual = model_components.get_actual(navigator, Q_, state_name, observations)
+    prediction = model_components.get_state_prediction(
+        navigator, functions_map, inputs_map, state_name, states_list, Q_
+    )
+    pi_obs_t = model_components.get_actual_precision(
+        navigator, pi_obs, Q_, state_name
+    )
+
+    if state_prior.size(0) == 0:
+        state_prior = torch.zeros(state_posterior.shape)
+        pi_prior = torch.full(state_posterior.shape, fill_value=1e-7)
+
+    return {
+        "state_prior": state_prior,
         "state_posterior": state_posterior,
-        "D_posterior": D_posterior,
+        "state_posterior_init_size": inputs_map[state_name],
+        "f_transition": f_transition,
         "pi_prior": pi_prior,
         "actual": actual,
         "prediction": prediction,
-        "pi_obs": pi_obs_t
+        "pi_obs": pi_obs_t,
     }
 
 
@@ -80,7 +87,7 @@ def get_one_hot_action_parents(action_one_hot, actions_id, navigator):
     return state_parents, action_name
 
 def preprocessing_for_excepted_free_energy(
-        all_action_of_state, action_name, parent_of_action, local_inputs_map, pi_priors, navigator, functions_map, Q_, states_list
+        all_action_of_state, action_name, parent_of_action, local_inputs_map, pi_states, navigator, functions_map, Q_, states_list
     ):
     f_action_inputs = actions_vectors_for_f(all_action_of_state, action_name, navigator)
     local_inputs_map |= f_action_inputs
@@ -93,7 +100,7 @@ def preprocessing_for_excepted_free_energy(
             local_inputs_map[output_f] = temporal_pred
 
     transition_cost = model_components.get_transition_cost(navigator, functions_map, local_inputs_map, parent_of_action, states_list, Q_)
-    pi_priors = pi_priors[parent_of_action]
+    pi_state = pi_states[parent_of_action]
 
     list_co_variances = []
     for q in Q_[parent_of_action]:
@@ -104,7 +111,7 @@ def preprocessing_for_excepted_free_energy(
     return {
         "temporal_pred": temporal_pred,
         "transition_cost": transition_cost,
-        "pi_priors": pi_priors,
+        "pi_priors": pi_state,
         "co_variances": co_variances
     }
 
