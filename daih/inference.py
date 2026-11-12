@@ -3,17 +3,26 @@ import torch.distributions as dist
 from . import utils
 import copy
 
-def euler_update(mu, dt, F_value):
-    # Gradient of F with respect to each mu_i
-    dF_dmu = torch.autograd.grad(F_value, mu, retain_graph=True)[0]
-    # D_mu: time derivative of each order
+def euler_update(mu, dt, F_value, max_grad_norm=100.0):
+    """Finite, norm-clipped Euler update of generalized coordinates."""
+    if not torch.isfinite(F_value).all():
+        return mu.detach().clone()
+    gradient = torch.autograd.grad(
+        F_value, mu, retain_graph=True, allow_unused=True
+    )[0]
+    if gradient is None or not torch.isfinite(gradient).all():
+        return mu.detach().clone()
+
+    norm = torch.linalg.vector_norm(gradient)
+    if torch.isfinite(norm) and norm > max_grad_norm:
+        gradient = gradient * (max_grad_norm / norm.clamp_min(1e-12))
+
     D_mu = torch.zeros_like(mu)
     D_mu[:-1] = mu[1:]
-
-    # Euler update for all orders
-    mu_next = mu + dt * (D_mu - dF_dmu)
-
-    return mu_next
+    updated = mu + float(dt) * (D_mu - gradient)
+    if not torch.isfinite(updated).all():
+        return mu.detach().clone()
+    return updated
 
 
 
@@ -134,99 +143,60 @@ def second_derivative_F(mu, F_value):
 
 
 def update_distributions(hessian, posterior, Q, eps=1e-6):
+    """Numerically robust posterior-distribution update.
+
+    Non-finite posterior/Hessian values are treated as a rejected update: the
+    previous distribution is retained rather than constructing Normal(NaN).
+    Hessians are symmetrized and projected to a positive-definite precision.
     """
-    Updates distributions using one Hessian matrix per group.
-
-    Parameters
-    ----------
-    hessian : torch.Tensor
-        Shape: (a, b, b).
-
-    posterior : torch.Tensor
-        Posterior means, one per group.
-
-    Q : list
-        Current probability distributions.
-
-    eps : float
-        Regularization term.
-
-    Returns
-    -------
-    list
-        Updated distributions.
-    """
-
     if eps <= 0:
         raise ValueError("eps must be strictly positive.")
-
     if hessian.ndim != 3:
-        raise ValueError(
-            "hessian must have shape (a, b, b)."
-        )
-
+        raise ValueError("hessian must have shape (a, b, b).")
     if hessian.shape[0] != len(Q):
-        raise ValueError(
-            "Number of Hessian matrices must match Q."
-        )
+        raise ValueError("Number of Hessian matrices must match Q.")
 
     for i, q in enumerate(Q):
+        H = hessian[i]
+        if not torch.isfinite(H).all():
+            continue
+        loc = posterior[i]
+        if not torch.isfinite(loc).all():
+            continue
 
-        # Retrieve the Hessian of group i
-        H_i = hessian[i]
-
-        # Numerical symmetrization
-        H_i = 0.5 * (H_i + H_i.T)
-
-        eye = torch.eye(
-            H_i.shape[-1],
-            device=H_i.device,
-            dtype=H_i.dtype
-        )
-
-        # Hessian -> Precision -> Covariance
-        precision_i = H_i + eps * eye
-
-        cov_i = torch.linalg.inv(precision_i)
+        H = 0.5 * (H + H.T)
+        # Work in float64 for the eigendecomposition/inversion. Negative and
+        # near-zero curvature cannot define a valid Gaussian precision.
+        try:
+            eigenvalues, eigenvectors = torch.linalg.eigh(H.to(torch.float64))
+            eigenvalues = eigenvalues.clamp(min=max(float(eps), 1e-6), max=1e8)
+            covariance = (eigenvectors * eigenvalues.reciprocal().unsqueeze(0)) @ eigenvectors.T
+            covariance = 0.5 * (covariance + covariance.T)
+            covariance = covariance.to(dtype=loc.dtype, device=loc.device)
+            covariance = torch.nan_to_num(covariance, nan=1.0, posinf=1e4, neginf=1e-6)
+        except RuntimeError:
+            continue
 
         if isinstance(q, dist.MultivariateNormal):
-
-            Q[i] = dist.MultivariateNormal(
-                loc=posterior[i],
-                covariance_matrix=cov_i
-            )
-
+            try:
+                # Keep covariance strictly positive definite after casting.
+                covariance = covariance + max(float(eps), 1e-6) * torch.eye(
+                    covariance.shape[-1], dtype=covariance.dtype, device=covariance.device
+                )
+                Q[i] = dist.MultivariateNormal(loc=loc, covariance_matrix=covariance)
+            except (ValueError, RuntimeError):
+                continue
         elif isinstance(q, dist.Normal):
-
-            # A scalar distribution must have a 1x1 Hessian
-            if H_i.shape != (1, 1):
+            if H.shape != (1, 1):
                 raise ValueError(
-                    f"Normal distribution at index {i} "
-                    f"requires a (1, 1) Hessian, "
-                    f"got {H_i.shape}."
+                    f"Normal distribution at index {i} requires a (1, 1) Hessian, got {H.shape}."
                 )
-
-            variance_i = cov_i[0, 0]
-
-            if variance_i <= 0:
-                raise ValueError(
-                    f"Non-positive variance at index {i}."
-                )
-
-            scale_i = torch.sqrt(variance_i)
-
-            Q[i] = dist.Normal(
-                loc=posterior[i],
-                scale=scale_i
-            )
-
+            variance = covariance[0, 0].clamp(min=1e-8, max=1e6)
+            scale = torch.sqrt(variance).clamp(min=1e-4, max=1e3)
+            Q[i] = dist.Normal(loc=loc, scale=scale)
         else:
-            raise TypeError(
-                f"Unsupported distribution: {type(q)}"
-            )
-
+            raise TypeError(f"Unsupported distribution: {type(q)}")
     return Q
-
 
 
 
@@ -242,6 +212,8 @@ def update_pi_prior(pi_states, pi_priors, hessian, state_name, eps=1e-6):
         raise KeyError(f"No state precision is defined for '{state_name}'.")
 
     prior = pi_states[state_name]
+    if not torch.isfinite(hessian).all():
+        return pi_states, pi_priors
     if hessian.ndim == 3:
         precision = torch.diagonal(hessian, dim1=-2, dim2=-1)
     elif hessian.ndim == 2:
@@ -258,9 +230,11 @@ def update_pi_prior(pi_states, pi_priors, hessian, state_name, eps=1e-6):
             f"but state precision has {prior.numel()}."
         )
 
-    precision = precision.reshape(prior.shape).to(
+    precision = torch.nan_to_num(
+        precision, nan=eps, posinf=1e8, neginf=eps
+    ).reshape(prior.shape).to(
         device=prior.device, dtype=prior.dtype
-    ).clamp_min(eps).detach()
+    ).clamp(min=eps, max=1e8).detach()
     pi_states[state_name] = precision
 
     # Update only the incoming edges of this child. No graph traversal is
@@ -307,10 +281,10 @@ def update_pi_obs(navigator, pi_obs, gamma_obs, F, Q_, state_name, dt=0.1, lr_ob
     # --------------------------------------------------
     # 3. Convert gamma_obs into actual precisions
     # --------------------------------------------------
-    new_pi_actual = torch.clamp(
-        torch.exp(new_gamma_obs),
-        min=1e-9,
-    ).detach()
+    new_gamma_obs = torch.nan_to_num(
+        new_gamma_obs, nan=0.0, posinf=20.0, neginf=-20.0
+    ).clamp(min=-20.0, max=20.0)
+    new_pi_actual = torch.exp(new_gamma_obs).clamp(min=1e-9, max=1e8).detach()
 
     new_pi_actual = torch.as_tensor(new_pi_actual).reshape(-1)
 
@@ -561,21 +535,18 @@ def seconde_derivative_from_output(f_out, mu, Pi_bruit=None, eps=1e-6):
 
 def update_threshold(list_pi_priors, F_list, pi_threshold, dt=0.1, k=1.0):
     list_grad = []
-
     for pi_prior, F in zip(list_pi_priors, F_list):
         grad_F = torch.autograd.grad(
-            F,
-            pi_prior,
-            create_graph=True,
-            retain_graph=True
+            F, pi_prior, create_graph=True, retain_graph=True, allow_unused=True
         )[0]
+        if grad_F is not None and torch.isfinite(grad_F).all():
+            list_grad.append(torch.sum(grad_F))
+    if not list_grad:
+        return pi_threshold.detach()
+    grad_sum = torch.stack(list_grad).sum()
+    updated = pi_threshold - k * dt * grad_sum
+    return updated.detach() if not torch.isfinite(updated).all() else updated
 
-        list_grad.append(torch.sum(grad_F))
-
-    grad_sum = torch.stack(list_grad).sum()   
-    pi_threshold_new = pi_threshold - k * dt * grad_sum
-
-    return pi_threshold_new
 
 
 def policy_error(G_prior, G_posterior, pi_p):

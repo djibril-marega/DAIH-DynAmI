@@ -8,8 +8,9 @@ Neuro-symbolic WorldModel with:
 - optional local functions, indexed by (state_id, layer_id, type);
 - global neural prediction when no local function is registered.
 
-Local functions are user-defined Python callables.
-They are neither trained nor registered in state_dict().
+Local functions are user-defined Python callables. Plain callables remain
+outside PyTorch parameter registration; local nn.Module instances are
+registered and can be optimized together with the global WorldModel.
 """
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Optional, Tuple, Union
@@ -110,7 +111,12 @@ class WorldModel(nn.Module):
 
         # Local callables are intentionally separated from PyTorch parameters:
         # they represent the provided rules/mathematics.
+        # Plain Python callables stay in a regular dictionary. nn.Module
+        # callables are also registered in ModuleDict so their parameters are
+        # visible to state_dict(), parameters(), and offline backpropagation.
         self._local_functions: Dict[Tuple[int, int, str], LocalFunction] = {}
+        self._local_modules = nn.ModuleDict()
+        self._local_module_keys: Dict[Tuple[int, int, str], str] = {}
 
     @staticmethod
     def _type_index(function_type: str) -> int:
@@ -136,18 +142,36 @@ class WorldModel(nn.Module):
         if not callable(function):
             raise TypeError("function must be callable.")
         key = (int(state_id), int(layer_id), function_type)
-        if key in self._local_functions and not replace:
+        exists = key in self._local_functions or key in self._local_module_keys
+        if exists and not replace:
             raise KeyError(f"A local function already exists for {key}.")
-        self._local_functions[key] = function
+
+        # Remove an older registration before replacing it with a different
+        # callable kind.
+        self._local_functions.pop(key, None)
+        old_module_key = self._local_module_keys.pop(key, None)
+        if old_module_key is not None and old_module_key in self._local_modules:
+            del self._local_modules[old_module_key]
+
+        if isinstance(function, nn.Module):
+            module_key = f"{int(state_id)}:{int(layer_id)}:{function_type}"
+            self._local_modules[module_key] = function
+            self._local_module_keys[key] = module_key
+        else:
+            self._local_functions[key] = function
 
     def unregister_local_function(
         self, state_id: int, layer_id: int, function_type: str
     ) -> None:
         key = (int(state_id), int(layer_id), function_type)
         self._local_functions.pop(key, None)
+        module_key = self._local_module_keys.pop(key, None)
+        if module_key is not None and module_key in self._local_modules:
+            del self._local_modules[module_key]
 
     def has_local_function(self, state_id: int, layer_id: int, function_type: str) -> bool:
-        return (int(state_id), int(layer_id), function_type) in self._local_functions
+        key = (int(state_id), int(layer_id), function_type)
+        return key in self._local_functions or key in self._local_module_keys
 
     def _as_batch(self, state: torch.Tensor):
         if not torch.is_tensor(state):
@@ -319,7 +343,13 @@ class WorldModel(nn.Module):
         """
         self._type_index(function_type)
         x, original_2d = self._as_batch(state)
-        local = self._local_functions.get((int(state_id), int(layer_id), function_type))
+        local_key = (int(state_id), int(layer_id), function_type)
+        module_key = self._local_module_keys.get(local_key)
+        local = (
+            self._local_modules[module_key]
+            if module_key is not None
+            else self._local_functions.get(local_key)
+        )
 
         if local is not None:
             local_input = self._restore_batch(x, original_2d)
