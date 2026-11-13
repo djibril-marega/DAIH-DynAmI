@@ -309,7 +309,9 @@ class OfflineArchitecture:
         old_hidden = int(old.hidden_dim)
         old_policy_hidden = int(old.policy_generator.initial_hidden.out_features)
         new_hidden = max(16, old_hidden + add_neurons)
-        new_policy_hidden = max(16, old_policy_hidden + add_neurons)
+        # Policy capacity is optimized by its own objective, not by the
+        # shared generative WorldModel neuron phase.
+        new_policy_hidden = old_policy_hidden
         new = WorldModel(
             hidden_dim=new_hidden,
             id_embedding_dim=old.state_embedding.embedding_dim,
@@ -322,6 +324,12 @@ class OfflineArchitecture:
             new = new.to(device)
         except StopIteration:
             pass
+
+        # Recreate state/layer-local blocks before copying their tensors.
+        for key, blocks in getattr(old, "local_context_blocks", {}).items():
+            state_id, layer_id = key[1:].split("_l", 1)
+            for _ in blocks:
+                new.add_local_context_layer(int(state_id), int(layer_id))
 
         old_state = old.state_dict()
         new_state = new.state_dict()
@@ -352,6 +360,80 @@ class OfflineArchitecture:
         for key, module_key in old._local_module_keys.items():
             new.register_local_function(key[0], key[1], key[2], old._local_modules[module_key])
         return new
+
+    @staticmethod
+    def _linear_saliency(weight: torch.Tensor) -> torch.Tensor:
+        gradient = getattr(weight, "grad", None)
+        if gradient is None:
+            return weight.detach().abs()
+        return weight.detach().abs() * gradient.detach().abs()
+
+    @classmethod
+    def _reorder_world_model_channels(cls, model: WorldModel) -> list[int]:
+        """Move least useful shared hidden channels to the tail before pruning.
+
+        Importance is a first-order |weight * gradient| proxy aggregated over
+        the shared encoder/decoders and local context adapters. This is safer
+        than blindly deleting the final channels, but is not a full ablation
+        estimate of the free-energy change.
+        """
+        width = int(model.hidden_dim)
+        scores = torch.zeros(width, device=next(model.parameters()).device)
+        input_prefix_layers = []
+        output_layers = []
+
+        def collect(module, input_width=None, output_width=None):
+            for child in module.modules():
+                if not isinstance(child, nn.Linear):
+                    continue
+                if child.out_features == width:
+                    output_layers.append(child)
+                if input_width is not None and child.in_features == input_width:
+                    input_prefix_layers.append((child, width))
+                elif child.in_features == width:
+                    input_prefix_layers.append((child, width))
+
+        collect(model.context_encoder)
+        collect(model.f_decoder)
+        collect(model.gv_decoder)
+        collect(model.local_fusion)
+        collect(model.local_context_blocks)
+
+        # The first decoder/fusion layers have metadata appended after the
+        # hidden context, so their hidden channels occupy the input prefix.
+        for layer in input_prefix_layers:
+            linear, _ = layer
+            saliency = cls._linear_saliency(linear.weight)
+            scores += saliency[:, :width].sum(dim=0).to(scores)
+        for linear in output_layers:
+            saliency = cls._linear_saliency(linear.weight)
+            scores += saliency.sum(dim=1).to(scores)
+            if linear.bias is not None:
+                bias_grad = linear.bias.grad
+                bias_score = (linear.bias.detach().abs() if bias_grad is None
+                              else linear.bias.detach().abs() * bias_grad.detach().abs())
+                scores += bias_score.to(scores)
+
+        # Keep the most useful channels first; resize then drops the tail.
+        order = torch.argsort(scores, descending=True)
+        for module in (model.context_encoder, model.f_decoder, model.gv_decoder,
+                       model.local_fusion, model.local_context_blocks):
+            for linear in module.modules():
+                if not isinstance(linear, nn.Linear):
+                    continue
+                with torch.no_grad():
+                    if linear.out_features == width:
+                        linear.weight.copy_(linear.weight.index_select(0, order))
+                        if linear.bias is not None:
+                            linear.bias.copy_(linear.bias.index_select(0, order))
+                    if linear.in_features == width:
+                        linear.weight.copy_(linear.weight.index_select(1, order))
+                    elif linear.in_features > width and module in (
+                            model.f_decoder, model.gv_decoder, model.local_fusion):
+                        # For context-plus-coordinate inputs, reorder only the
+                        # leading context columns; leave coordinate features intact.
+                        linear.weight[:, :width].copy_(linear.weight[:, :width].index_select(1, order))
+        return order.detach().cpu().tolist()
 
     def _replace_world_model(self, delta: int = 0, add_layer: bool = False):
         old_modules = []
@@ -413,6 +495,10 @@ class OfflineArchitecture:
         candidates = []
         for root in modules:
             for module_name, module in root.named_modules():
+                path_parts = module_name.split(".") if module_name else []
+                if ("policy_generator" in path_parts
+                        or any(part.endswith(":p") for part in path_parts)):
+                    continue
                 for registered_name, parameter in module.named_parameters(recurse=False):
                     if registered_name not in ("weight", "weight_orig"):
                         continue
@@ -509,9 +595,9 @@ class OfflineArchitecture:
         gf = deepcopy(self.agent.generative_functions)
         applied, skipped = [], []
         world_neuron_delta = 0
-        add_world_layer = False
-        remove_state_candidates = []
+        local_layer_changes = []
         structural_applied = False
+        global_inplace_results = {}
 
         for mutation in mutations:
             state = mutation.get("target")
@@ -522,14 +608,20 @@ class OfflineArchitecture:
             c = self._constraint(state)
             ok = False
             if action == "prune_obsolete_weights":
-                result = self._prune_obsolete_weights()
+                result = global_inplace_results.get(action)
+                if result is None:
+                    result = self._prune_obsolete_weights()
+                    global_inplace_results[action] = result
                 if result["pruned"]:
                     applied.append({**mutation, "result": result})
                 else:
                     skipped.append({**mutation, "reason": "no_eligible_weights", "result": result})
                 continue
             elif action == "regularize_hyperparameters":
-                changed = self._regularize_hyperparameters()
+                changed = global_inplace_results.get(action)
+                if changed is None:
+                    changed = self._regularize_hyperparameters()
+                    global_inplace_results[action] = changed
                 if changed:
                     applied.append({**mutation, "result": {"changed": changed}})
                 else:
@@ -541,15 +633,34 @@ class OfflineArchitecture:
             elif action == "prune_neurons" and c["allow_neurons"]:
                 world_neuron_delta -= int(self.config.neuron_step)
                 ok = True
-            elif action == "add_intermediate_layer" and c["allow_intermediate_layers"]:
-                current_layers = max((getattr(m, "_offline_extra_layers", 0) for m in self.agent.functions_map.values() if isinstance(m, WorldModel)), default=0)
-                ok = current_layers < int(c["max_intermediate_layers"])
-                add_world_layer = add_world_layer or ok
-            elif action == "prune_intermediate_layer" and c["allow_intermediate_layers"]:
-                current_layers = max((getattr(m, "_offline_extra_layers", 0) for m in self.agent.functions_map.values() if isinstance(m, WorldModel)), default=0)
-                ok = current_layers > int(c["min_intermediate_layers"])
+            elif action in {"add_intermediate_layer", "prune_intermediate_layer"} and c["allow_intermediate_layers"]:
+                # Phase 4 is local: it changes only the context path for the
+                # state/layer that triggered the mutation, never the shared encoder.
+                state_id = self.agent.states_list.index(state) + 1
+                layer_id = int(gf[state].get("layer", 0))
+                modules, seen = [], set()
+                for value in self.agent.functions_map.values():
+                    if isinstance(value, WorldModel) and id(value) not in seen:
+                        modules.append(value)
+                        seen.add(id(value))
+                counts = [m.local_context_layer_count(state_id, layer_id) for m in modules]
+                current_layers = max(counts, default=0)
+                if action == "add_intermediate_layer":
+                    ok = current_layers < int(c["max_intermediate_layers"])
+                    if ok:
+                        for module in modules:
+                            module.add_local_context_layer(state_id, layer_id)
+                else:
+                    ok = current_layers > int(c["min_intermediate_layers"])
+                    if ok:
+                        for module in modules:
+                            module.remove_local_context_layer(state_id, layer_id)
                 if ok:
-                    self._replace_world_model(add_layer=False)
+                    local_layer_changes.append({
+                        "state_id": state_id,
+                        "layer_id": layer_id,
+                        "layers": current_layers + (1 if action == "add_intermediate_layer" else -1),
+                    })
             elif action == "add_generalized_coordinate" and c["allow_coordinates"]:
                 ok = self._mutate_coordinates(D, state, True)
             elif action == "remove_low_utility_coordinate" and c["allow_coordinates"]:
@@ -587,7 +698,11 @@ class OfflineArchitecture:
             (applied if ok else skipped).append(
                 {**mutation, "reason": None if ok else "constraint_limit_or_noop"}
             )
-            structural_applied = structural_applied or bool(ok)
+            if action not in {
+                "add_intermediate_layer", "prune_intermediate_layer",
+                "add_neurons", "prune_neurons",
+            }:
+                structural_applied = structural_applied or bool(ok)
 
         if structural_applied:
             # Validate the complete declarative result before touching the
@@ -615,19 +730,40 @@ class OfflineArchitecture:
                 old_modules = [v for v in self.agent.functions_map.values() if isinstance(v, WorldModel)]
                 if old_modules:
                     old_dim = old_modules[0].hidden_dim
-                    min_dim = max(int(x["min_neurons"]) for x in limits)
-                    max_dim = min(int(x["max_neurons"]) for x in limits)
+                    min_dim = max(
+                        int(self.config.world_model_min_neurons),
+                        max(int(x["min_neurons"]) for x in limits),
+                    )
+                    max_dim = min(
+                        int(self.config.world_model_max_neurons),
+                        min(int(x["max_neurons"]) for x in limits),
+                    )
                     delta = max(min_dim - old_dim, min(max_dim - old_dim, world_neuron_delta))
                     if delta:
+                        if delta < 0:
+                            seen_models = set()
+                            for module in old_modules:
+                                if id(module) not in seen_models:
+                                    seen_models.add(id(module))
+                                    self._reorder_world_model_channels(module)
                         self._replace_world_model(delta=delta)
-        if add_world_layer:
-            self._replace_world_model(add_layer=True)
-
+                        trainer = getattr(self.agent, "_offline_trainer", None)
+                        if trainer is not None:
+                            trainer.invalidate_optimizer()
         rebuilt = False
         if structural_applied:
             self._rebuild(D, gf)
             rebuilt = True
-        return {"applied": applied, "skipped": skipped, "rebuilt": rebuilt}
+        elif local_layer_changes:
+            trainer = getattr(self.agent, "_offline_trainer", None)
+            if trainer is not None:
+                trainer.invalidate_optimizer()
+        return {
+            "applied": applied,
+            "skipped": skipped,
+            "rebuilt": rebuilt,
+            "local_layer_changes": local_layer_changes,
+        }
 
     @staticmethod
     def _restore_existing_beliefs(agent, old_Q):
@@ -817,10 +953,14 @@ class OfflineArchitecture:
         for name, node in agent.navigator.graph.items():
             if node.get("type") != "state":
                 continue
-            progress = previous_progress.get(name, StateProgress())
+            default_phase = 4 if getattr(trainer, "global_progress", None) is not None and trainer.global_progress.phase >= 4 else 1
+            progress = previous_progress.get(name, StateProgress(phase=default_phase))
             progress.history.clear()
             progress.pending_mutation = False
             progress.stable = False
+            progress.phase_iterations = 0
+            progress.phase_entry_free_energy = None
+            progress.phase_best_free_energy = None
             next_progress[name] = progress
         trainer.progress = next_progress
         if hasattr(trainer, "invalidate_optimizer"):

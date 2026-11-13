@@ -77,6 +77,10 @@ class WorldModel(nn.Module):
             nn.GELU(),
         )
 
+        # Optional context blocks owned by one (state, layer) pair. Unlike
+        # context_encoder, these blocks are local and can evolve independently.
+        self.local_context_blocks = nn.ModuleDict()
+
         # Decoder f: one output per element of the input matrix.
         self.f_decoder = nn.Sequential(
             nn.Linear(hidden_dim + 5, hidden_dim),
@@ -117,6 +121,44 @@ class WorldModel(nn.Module):
         self._local_functions: Dict[Tuple[int, int, str], LocalFunction] = {}
         self._local_modules = nn.ModuleDict()
         self._local_module_keys: Dict[Tuple[int, int, str], str] = {}
+
+    def _load_from_state_dict(
+        self, state_dict, prefix, local_metadata, strict,
+        missing_keys, unexpected_keys, error_msgs,
+    ):
+        """Materialize dynamic local context blocks before PyTorch loads children.
+
+        This keeps ordinary persistence checkpoints compatible with the
+        state/layer-local ModuleDict introduced by the offline controller.
+        """
+        marker = prefix + "local_context_blocks."
+        block_counts = {}
+        for name in state_dict.keys():
+            if not name.startswith(marker):
+                continue
+            remainder = name[len(marker):]
+            parts = remainder.split(".")
+            if len(parts) < 3 or not parts[1].isdigit():
+                continue
+            module_key = parts[0]
+            block_counts[module_key] = max(
+                block_counts.get(module_key, 0), int(parts[1]) + 1
+            )
+        for module_key, count in block_counts.items():
+            if module_key in self.local_context_blocks:
+                continue
+            try:
+                state_part, layer_part = module_key[1:].split("_l", 1)
+                state_id, layer_id = int(state_part), int(layer_part)
+            except (ValueError, IndexError):
+                continue
+            for _ in range(count):
+                self.add_local_context_layer(state_id, layer_id)
+
+        super()._load_from_state_dict(
+            state_dict, prefix, local_metadata, strict,
+            missing_keys, unexpected_keys, error_msgs,
+        )
 
     @staticmethod
     def _type_index(function_type: str) -> int:
@@ -212,6 +254,66 @@ class WorldModel(nn.Module):
         # resizing the embeddings. Collisions remain possible.
         return torch.remainder(ids, self.id_buckets)
 
+    @staticmethod
+    def _local_context_key(state_id: int, layer_id: int) -> str:
+        return f"s{int(state_id)}_l{int(layer_id)}"
+
+    def local_context_layer_count(self, state_id: int, layer_id: int) -> int:
+        key = self._local_context_key(state_id, layer_id)
+        if key not in self.local_context_blocks:
+            return 0
+        return len(self.local_context_blocks[key])
+
+    def add_local_context_layer(self, state_id: int, layer_id: int) -> int:
+        """Add a residual-free hidden block scoped to one agent state/layer."""
+        key = self._local_context_key(state_id, layer_id)
+        if key not in self.local_context_blocks:
+            self.local_context_blocks[key] = nn.ModuleList()
+        block = nn.Sequential(
+            nn.Linear(self.hidden_dim, self.hidden_dim),
+            nn.GELU(),
+        )
+        try:
+            block = block.to(next(self.parameters()).device)
+        except StopIteration:
+            pass
+        self.local_context_blocks[key].append(block)
+        return len(self.local_context_blocks[key])
+
+    def remove_local_context_layer(self, state_id: int, layer_id: int) -> bool:
+        key = self._local_context_key(state_id, layer_id)
+        if key not in self.local_context_blocks:
+            return False
+        blocks = self.local_context_blocks[key]
+        if not len(blocks):
+            del self.local_context_blocks[key]
+            return False
+        del blocks[-1]
+        if not len(blocks):
+            del self.local_context_blocks[key]
+        return True
+
+    def _apply_local_context(self, context, state_id, layer_id):
+        batch = context.shape[0]
+        state_ids = torch.as_tensor(state_id, device=context.device, dtype=torch.long).reshape(-1)
+        layer_ids = torch.as_tensor(layer_id, device=context.device, dtype=torch.long).reshape(-1)
+        if state_ids.numel() == 1:
+            state_ids = state_ids.expand(batch)
+        if layer_ids.numel() == 1:
+            layer_ids = layer_ids.expand(batch)
+        if state_ids.numel() != batch or layer_ids.numel() != batch:
+            raise ValueError("state_id and layer_id must be scalars or have one value per batch item.")
+
+        rows = []
+        for index in range(batch):
+            key = self._local_context_key(state_ids[index].item(), layer_ids[index].item())
+            value = context[index:index + 1]
+            if key in self.local_context_blocks:
+                for block in self.local_context_blocks[key]:
+                    value = value + block(value)
+            rows.append(value)
+        return torch.cat(rows, dim=0)
+
     def encode_context(
         self, state: torch.Tensor, state_id, layer_id, function_type: str
     ) -> torch.Tensor:
@@ -245,7 +347,8 @@ class WorldModel(nn.Module):
             ],
             dim=1,
         )
-        return self.context_encoder(features)
+        context = self.context_encoder(features)
+        return self._apply_local_context(context, state_id, layer_id)
 
     @staticmethod
     def _grid(batch, rows, cols, device, dtype):
