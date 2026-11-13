@@ -1,4 +1,4 @@
-"""Adaptive offline optimization for Agent_DAIH (v6).
+"""Adaptive offline optimization for Agent_DAIH (v7).
 
 The shared WorldModel is optimized against the sum of all state free energies.
 Policy generators are optimized separately with expected-free-energy policy
@@ -75,6 +75,9 @@ class OfflineConfig:
     # Training scopes. The WorldModel objective remains the sum of all F_i.
     train_world_model: bool = True
     train_policy: bool = True
+    # The motor function is user-owned. Its training is opt-in and delegated
+    # to the user-provided motor_train_fn callback.
+    train_motor: bool = False
     weights_only: bool = False  # disables all architecture/phase mutations
     policy_learning_rate: float | None = None
     policy_efe_weight: float = 1.0
@@ -310,11 +313,59 @@ class OfflineTrainer:
             return [deepcopy(item) for item in observations]
         raise TypeError("observations must be a dictionary or a non-empty sequence of dictionaries.")
 
-    def _build_belief_contexts(self, observations: list[dict], initial: dict[str, Any]):
-        """Run local E-steps and retain one ephemeral belief snapshot per observation."""
+    @staticmethod
+    def _reset_motor(motor_fn: Callable | None, initial_observation: dict) -> None:
+        """Reset optional user-owned motor-function memory before a replay."""
+        if motor_fn is None:
+            return
+        reset = getattr(motor_fn, "reset", None)
+        if callable(reset):
+            reset(deepcopy(initial_observation))
+
+    @staticmethod
+    def _call_motor(
+        motor_fn: Callable,
+        observation: dict,
+        motors: dict[str, float] | None,
+    ) -> dict:
+        """Let the user's motor function materialize an action in-place.
+
+        The callback receives the observation schema defined by the caller and
+        the flat motor-output dictionary (or None). It may mutate the supplied
+        observation and return it, or return None after an in-place mutation.
+        """
+        if not callable(motor_fn):
+            raise TypeError("motor_fn must be callable.")
+        result = motor_fn(observation, deepcopy(motors) if motors else None)
+        if result is None:
+            return observation
+        if not isinstance(result, dict):
+            raise TypeError("motor_fn must return an observation dictionary or None.")
+        return result
+
+    def _build_belief_contexts(
+        self,
+        observations: list[dict],
+        initial: dict[str, Any],
+        *,
+        motor_fn: Callable | None = None,
+        motor_trace: list[dict[str, Any]] | None = None,
+    ):
+        """Run E-steps in order and apply each motor output to its observation.
+
+        Historical input dictionaries are copied. The user callback receives
+        that same working dictionary and can modify only fields already
+        present in the user-defined observation schema.
+        """
         if not hasattr(self.agent, "beliefs_update"):
             raise RuntimeError("Temporal/independent offline inference requires Agent_DAIH.beliefs_update().")
+        if motor_fn is not None and self.config.observation_mode != "temporal":
+            raise ValueError("motor_fn requires observation_mode='temporal'.")
+
         contexts = []
+        if motor_fn is not None:
+            self._reset_motor(motor_fn, observations[0])
+
         old_offline = getattr(self.agent, "offline", False)
         old_dt = getattr(self.agent, "_offline_dt", None)
         old_clip = getattr(self.agent, "_offline_belief_gradient_clip", None)
@@ -322,7 +373,7 @@ class OfflineTrainer:
             self.agent.offline = True
             self.agent._offline_dt = self.config.dt
             self.agent._offline_belief_gradient_clip = self.config.belief_gradient_clip
-            for observation in observations:
+            for index, observation in enumerate(observations):
                 if self.config.observation_mode == "independent":
                     self._restore_beliefs(initial)
                 prepared = deepcopy(observation)
@@ -331,9 +382,34 @@ class OfflineTrainer:
                 )
                 self.agent.pi_obs = pi_obs
                 self.agent.pi_obs_substitued = pi_substituted
-                # beliefs_update mutates only the temporary belief state here.
-                for _ in self.agent.beliefs_update(prepared):
-                    pass
+
+                # Flatten motor outputs: state names are not part of the
+                # environment's observation/action contract.
+                motors: dict[str, float] = {}
+                state_free_energies: dict[str, float | None] = {}
+                for item in self.agent.beliefs_update(prepared):
+                    if not isinstance(item, tuple) or len(item) != 3:
+                        continue
+                    state_motors, free_energy, state_name = item
+                    state_free_energies[state_name] = (
+                        float(free_energy.detach().cpu().item())
+                        if torch.is_tensor(free_energy) and torch.isfinite(free_energy).all()
+                        else None
+                    )
+                    if isinstance(state_motors, dict):
+                        motors.update(deepcopy(state_motors))
+
+                if motor_fn is not None:
+                    prepared = self._call_motor(motor_fn, prepared, motors or None)
+
+                if motor_trace is not None:
+                    motor_trace.append({
+                        "observation_index": index,
+                        "motors": deepcopy(motors) if motors else None,
+                        "observation_after_motor": deepcopy(prepared),
+                        "free_energy_by_state": state_free_energies,
+                    })
+
                 contexts.append((prepared, self._snapshot_beliefs()))
         finally:
             self._restore_beliefs(initial)
@@ -1380,6 +1456,8 @@ class OfflineTrainer:
         *,
         test_observations: dict | list[dict] | tuple[dict, ...] | None = None,
         rebuild_callback: Callable | None = None,
+        motor_fn: Callable | None = None,
+        motor_train_fn: Callable | None = None,
     ) -> dict[str, Any]:
         self._validate_config()
         if self.agent.navigator is None:
@@ -1388,18 +1466,32 @@ class OfflineTrainer:
         test_frames = self._normalize_observations(
             test_observations if test_observations is not None else observations
         )
+        if self.config.train_motor and motor_fn is None:
+            raise ValueError("train_motor=True requires a user-supplied motor_fn.")
+        if self.config.train_motor and not callable(motor_train_fn):
+            raise ValueError("train_motor=True requires motor_train_fn(records, observations).")
+        if motor_fn is not None and self.config.observation_mode != "temporal":
+            raise ValueError("A motor_fn requires observation_mode='temporal'.")
         self.iteration += 1
 
         # Beliefs are ephemeral during offline training. Build one posterior
         # context per frame, carrying it forward only in temporal mode.
         initial_beliefs = self._snapshot_beliefs()
-        test_contexts = self._build_belief_contexts(test_frames, initial_beliefs)
+        test_contexts = self._build_belief_contexts(
+            test_frames, initial_beliefs, motor_fn=motor_fn
+        )
         F_before, _ = self._evaluate(test_contexts)
         checkpoint_path = self._checkpoint_before(F_before)
         # Keep the starting model if subsequent optimization makes it worse.
         best_agent_updated = self._consider_best_agent(F_before)
 
-        training_contexts = self._build_belief_contexts(training_frames, initial_beliefs)
+        motor_trace: list[dict[str, Any]] = []
+        training_contexts = self._build_belief_contexts(
+            training_frames,
+            initial_beliefs,
+            motor_fn=motor_fn,
+            motor_trace=motor_trace,
+        )
         training_batches = [(frame, context) for frame, context in training_contexts]
 
         # The E-step updates temporary Q_t contexts; the M-step optimizes the
@@ -1418,17 +1510,35 @@ class OfflineTrainer:
             policy_optimization = self._mean_policy_results(policy_results)
         else:
             policy_optimization = {"updated": False, "loss": None, "parameters": 0, "disabled": True}
-        belief_updates = [{"observation_index": i, "inference_updated": True}
-                          for i in range(len(training_batches))]
 
-        # Re-infer test beliefs with the updated generative model.
-        test_contexts_after = self._build_belief_contexts(test_frames, initial_beliefs)
+        motor_optimization = {"updated": False, "disabled": True}
+        if self.config.train_motor:
+            motor_optimization = motor_train_fn(
+                deepcopy(motor_trace), deepcopy(training_frames)
+            )
+            if motor_optimization is None:
+                motor_optimization = {"updated": True, "result": None}
+
+        belief_updates = [
+            {
+                "observation_index": item["observation_index"],
+                "inference_updated": True,
+                "motors": deepcopy(item["motors"]),
+                "observation_after_motor": deepcopy(item["observation_after_motor"]),
+            }
+            for item in motor_trace
+        ]
+
+        # Re-infer test beliefs with the updated generative model and motor callback.
+        test_contexts_after = self._build_belief_contexts(
+            test_frames, initial_beliefs, motor_fn=motor_fn
+        )
         F_after, metrics_after = self._evaluate(test_contexts_after)
         self.last_metrics = metrics_after
 
         decisions, proposed = self._update_progress(metrics_after)
         plan = {
-            "version": "6.0",
+            "version": "7.1",
             "observation_mode": self.config.observation_mode,
             "observations_processed": len(training_frames),
             "phase_transition_mode": self.config.phase_transition_mode,
@@ -1456,7 +1566,9 @@ class OfflineTrainer:
                 "Policy generators use expected-free-energy REINFORCE and G_prior/G_posterior alignment. "
                 "Phase-4 context blocks are state/layer-local; later coordinate/state/hierarchy mutations "
                 "are local to their target declaration. Per-observation beliefs are temporary; "
-                "persistent Q and online precision state are restored after offline inference."
+                "persistent Q and online precision state are restored after offline inference. "
+                "The user motor callback receives flat motor outputs and can modify existing "
+                "fields of the working observation dictionary."
             ),
         }
 
@@ -1528,7 +1640,9 @@ class OfflineTrainer:
                 if rebuilt:
                     # A structural rebuild may change posterior dimensions.
                     initial_beliefs = self._snapshot_beliefs()
-                test_contexts_rebuilt = self._build_belief_contexts(test_frames, initial_beliefs)
+                test_contexts_rebuilt = self._build_belief_contexts(
+                    test_frames, initial_beliefs, motor_fn=motor_fn
+                )
                 F_after, metrics_after = self._evaluate(test_contexts_rebuilt)
                 self.last_metrics = metrics_after
                 plan_to_persist["F_global_test_after"] = F_after
@@ -1568,6 +1682,9 @@ class OfflineTrainer:
             "iteration": self.iteration,
             "optimization": optimization,
             "policy_optimization": policy_optimization,
+            "motor_optimization": motor_optimization,
+            "motor_outputs": [deepcopy(item["motors"]) for item in motor_trace],
+            "motor_trace": motor_trace,
             "belief_updates": belief_updates,  # ephemeral per-observation inference; persistent Q is restored
             "q_updated_offline": False,
             "observation_mode": self.config.observation_mode,

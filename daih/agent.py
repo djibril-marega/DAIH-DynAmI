@@ -427,6 +427,8 @@ class Agent_DAIH():
         test_observations=None,
         config=None,
         rebuild_callback=None,
+        motor_fn=None,
+        motor_train_fn=None,
     ):
         """
         Run exactly one global offline-learning iteration.
@@ -443,6 +445,16 @@ class Agent_DAIH():
         rebuild_callback:
             Optional callback that applies the proposed structural plan and
             returns a new model specification. See README_OFFLINE.md.
+        motor_fn:
+            Optional user-defined callable with signature
+            ``motor_fn(observation, motors)``. It receives a working copy of
+            the observation and the flat motor-output dictionary, or None.
+            It may mutate existing observation fields and return the modified
+            dictionary, or return None after mutating in place.
+        motor_train_fn:
+            Optional user-owned callback receiving (motor_trace,
+            historical_observations). It is called only when
+            OfflineConfig.train_motor is True.
 
         Returns
         -------
@@ -464,4 +476,6 @@ class Agent_DAIH():
             observations,
             test_observations=test_observations,
             rebuild_callback=rebuild_callback,
+            motor_fn=motor_fn,
+            motor_train_fn=motor_train_fn,
         )
