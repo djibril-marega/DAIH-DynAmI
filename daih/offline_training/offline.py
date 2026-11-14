@@ -14,7 +14,7 @@ from collections import defaultdict, deque
 from copy import deepcopy
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
 from contextlib import contextmanager
 import json
 import math
@@ -364,13 +364,33 @@ class OfflineTrainer:
 
     @staticmethod
     def _normalize_observations(observations: Any) -> list[dict]:
+        """Normalize one bounded training window.
+
+        Any iterable of observation dictionaries is accepted, including a
+        generator. The iterable is materialized only for the current window;
+        callers should therefore feed bounded generators rather than an
+        entire multi-gigabyte dataset.
+        """
         if isinstance(observations, dict):
             return [deepcopy(observations)]
-        if isinstance(observations, (list, tuple)) and observations:
-            if not all(isinstance(item, dict) for item in observations):
-                raise TypeError("A sequence dataset must contain dictionaries, one per observation.")
-            return [deepcopy(item) for item in observations]
-        raise TypeError("observations must be a dictionary or a non-empty sequence of dictionaries.")
+        if observations is None or isinstance(observations, (str, bytes)):
+            raise TypeError("observations must be a dict or an iterable of dictionaries.")
+        try:
+            frames = []
+            for index, item in enumerate(observations):
+                if not isinstance(item, dict):
+                    raise TypeError(
+                        f"Observation #{index} must be a dictionary, got "
+                        f"{type(item).__name__}."
+                    )
+                frames.append(deepcopy(item))
+        except TypeError:
+            raise
+        except Exception as exc:
+            raise TypeError("Could not consume the observations iterable.") from exc
+        if not frames:
+            raise ValueError("The observations iterable is empty.")
+        return frames
 
     @staticmethod
     def _reset_motor(motor_fn: Callable | None, initial_observation: dict) -> None:
@@ -1528,9 +1548,9 @@ class OfflineTrainer:
 
     def step(
         self,
-        observations: dict | list[dict] | tuple[dict, ...],
+        observations: Any,
         *,
-        test_observations: dict | list[dict] | tuple[dict, ...] | None = None,
+        test_observations: Any = None,
         rebuild_callback: Callable | None = None,
         motor_fn: Callable | None = None,
         motor_train_fn: Callable | None = None,
@@ -1538,9 +1558,13 @@ class OfflineTrainer:
         self._validate_config()
         if self.agent.navigator is None:
             raise RuntimeError("Call Agent_DAIH.model() before training_offline().")
+        # Consume a possibly one-shot generator exactly once. When no held-out
+        # stream is supplied, the bounded training window is also the test set.
         training_frames = self._normalize_observations(observations)
-        test_frames = self._normalize_observations(
-            test_observations if test_observations is not None else observations
+        test_frames = (
+            training_frames
+            if test_observations is None
+            else self._normalize_observations(test_observations)
         )
         if self.config.train_motor and motor_fn is None:
             raise ValueError("train_motor=True requires a user-supplied motor_fn.")
