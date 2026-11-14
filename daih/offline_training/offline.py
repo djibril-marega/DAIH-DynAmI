@@ -193,6 +193,16 @@ class OfflineTrainer:
             "min_states", "max_states", "allow_state_addition", "allow_state_removal"
         }
         for state_name, constraints in self.config.state_constraints.items():
+            for flag in (
+                "allow_mutations", "allow_removal", "allow_neurons",
+                "allow_intermediate_layers", "allow_coordinates",
+                "allow_under_state", "allow_hierarchy_addition",
+                "allow_hierarchy_removal",
+            ):
+                if flag in constraints and not isinstance(constraints[flag], bool):
+                    raise ValueError(
+                        f"state_constraints[{state_name!r}][{flag!r}] must be a boolean."
+                    )
             misplaced = graph_level_keys.intersection(constraints)
             if misplaced:
                 names = ", ".join(sorted(misplaced))
@@ -1172,7 +1182,10 @@ class OfflineTrainer:
             if global_decorrelated:
                 target = next((
                     name for name in metrics
-                    if global_state.phase != 3 or self.config.state_constraints.get(name, {}).get("allow_neurons", True)
+                    if global_state.phase != 3 or (
+                        self.config.state_constraints.get(name, {}).get("allow_mutations", True)
+                        and self.config.state_constraints.get(name, {}).get("allow_neurons", True)
+                    )
                 ), next(iter(metrics)))
                 global_operation = self._mutation_for(target, global_state.phase, True)
                 if global_operation.get("action") != "none":
@@ -1190,7 +1203,10 @@ class OfflineTrainer:
                     if global_state.phase == 3:
                         target = next((
                             name for name in metrics
-                            if self.config.state_constraints.get(name, {}).get("allow_neurons", True)
+                            if (
+                                self.config.state_constraints.get(name, {}).get("allow_mutations", True)
+                                and self.config.state_constraints.get(name, {}).get("allow_neurons", True)
+                            )
                         ), next(iter(metrics)))
                         global_operation = self._mutation_for(target, 3, False)
                         global_operation["scope"] = "world_model"

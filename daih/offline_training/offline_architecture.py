@@ -24,6 +24,9 @@ class OfflineArchitecture:
 
     def _constraint(self, state_name: str) -> dict:
         defaults = {
+            # State-local lock and state deletion permission are independent.
+            "allow_mutations": True,
+            "allow_removal": True,
             "allow_neurons": True,
             "allow_intermediate_layers": True,
             "allow_coordinates": True,
@@ -46,6 +49,15 @@ class OfflineArchitecture:
             defaults["min_under_state"] = supplied["min_size"]
         if "max_under_state" not in supplied and "max_size" in supplied:
             defaults["max_under_state"] = supplied["max_size"]
+        # A state-wide mutation lock overrides the individual internal
+        # mutation switches, while hierarchy operations and graph deletion
+        # retain their own explicit permissions.
+        if not defaults["allow_mutations"]:
+            for key in (
+                "allow_neurons", "allow_intermediate_layers",
+                "allow_coordinates", "allow_under_state",
+            ):
+                defaults[key] = False
         return defaults
 
     def _graph_constraint(self) -> dict:
@@ -841,7 +853,8 @@ class OfflineArchitecture:
                     applied.append({**mutation, "created_state": new_name})
                     structural_applied = True
                 continue
-            elif action == "remove_redundant_state" and self._graph_constraint()["allow_state_removal"]:
+            elif (action == "remove_redundant_state" and c["allow_removal"]
+                    and self._graph_constraint()["allow_state_removal"]):
                 ok = self._remove_state(
                     D, gf, state, min_states=self._graph_constraint()["min_states"]
                 )
@@ -857,7 +870,8 @@ class OfflineArchitecture:
                     applied.append({**mutation, "created_state": new_name})
                     structural_applied = True
                 continue
-            elif (action == "remove_redundant_hierarchy_layer" and c["allow_hierarchy_removal"]
+            elif (action == "remove_redundant_hierarchy_layer"
+                    and c["allow_hierarchy_removal"]
                     and self._graph_constraint()["allow_state_removal"]):
                 ok = self._remove_state(
                     D, gf, state, min_states=self._graph_constraint()["min_states"]
