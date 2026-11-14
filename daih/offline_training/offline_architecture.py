@@ -28,8 +28,6 @@ class OfflineArchitecture:
             "allow_intermediate_layers": True,
             "allow_coordinates": True,
             "allow_under_state": True,
-            "allow_state_addition": True,
-            "allow_state_removal": True,
             "allow_hierarchy_addition": True,
             "allow_hierarchy_removal": True,
             "min_coordinates": 1,
@@ -40,8 +38,6 @@ class OfflineArchitecture:
             "max_neurons": 1024,
             "min_intermediate_layers": 0,
             "max_intermediate_layers": 8,
-            "min_states": 1,
-            "max_states": None,
         }
         supplied = self.config.state_constraints.get(state_name, {})
         defaults.update(supplied)
@@ -50,6 +46,24 @@ class OfflineArchitecture:
             defaults["min_under_state"] = supplied["min_size"]
         if "max_under_state" not in supplied and "max_size" in supplied:
             defaults["max_under_state"] = supplied["max_size"]
+        return defaults
+
+    def _graph_constraint(self) -> dict:
+        """Return constraints applying to the graph as a whole."""
+        defaults = {
+            "min_states": 1,
+            "max_states": None,
+            "allow_state_addition": True,
+            "allow_state_removal": True,
+        }
+        defaults.update(self.config.graph_constraints or {})
+        # Keep the historical global cap as an additional upper bound.
+        legacy_cap = self.config.max_total_states
+        if legacy_cap is not None:
+            if defaults["max_states"] is None:
+                defaults["max_states"] = int(legacy_cap)
+            else:
+                defaults["max_states"] = min(int(defaults["max_states"]), int(legacy_cap))
         return defaults
 
     @staticmethod
@@ -254,10 +268,13 @@ class OfflineArchitecture:
 
     def _add_state(self, D, gf, target: str, hierarchy: bool):
         self._last_add_state_reason = None
-        c = self._constraint(target)
-        if c.get("max_states") is not None and len(gf) >= int(c["max_states"]):
+        graph_constraints = self._graph_constraint()
+        if not graph_constraints["allow_state_addition"]:
+            self._last_add_state_reason = "state_addition_disabled"
             return None
-        if self.config.max_total_states is not None and len(gf) >= int(self.config.max_total_states):
+        if (graph_constraints["max_states"] is not None
+                and len(gf) >= int(graph_constraints["max_states"])):
+            self._last_add_state_reason = "max_states_reached"
             return None
         names = set(gf)
         prefix = "offline_hierarchy_state" if hierarchy else "offline_state"
@@ -813,7 +830,7 @@ class OfflineArchitecture:
                     })
                     structural_applied = True
                     continue
-            elif action == "add_state" and c["allow_state_addition"]:
+            elif action == "add_state" and self._graph_constraint()["allow_state_addition"]:
                 new_name = self._add_state(D, gf, state, hierarchy=False)
                 if new_name is None:
                     skipped.append({
@@ -824,9 +841,12 @@ class OfflineArchitecture:
                     applied.append({**mutation, "created_state": new_name})
                     structural_applied = True
                 continue
-            elif action == "remove_redundant_state" and c["allow_state_removal"]:
-                ok = self._remove_state(D, gf, state, min_states=c["min_states"])
-            elif action == "add_hierarchy_layer" and c["allow_hierarchy_addition"]:
+            elif action == "remove_redundant_state" and self._graph_constraint()["allow_state_removal"]:
+                ok = self._remove_state(
+                    D, gf, state, min_states=self._graph_constraint()["min_states"]
+                )
+            elif (action == "add_hierarchy_layer" and c["allow_hierarchy_addition"]
+                    and self._graph_constraint()["allow_state_addition"]):
                 new_name = self._add_state(D, gf, state, hierarchy=True)
                 if new_name is None:
                     skipped.append({
@@ -837,8 +857,11 @@ class OfflineArchitecture:
                     applied.append({**mutation, "created_state": new_name})
                     structural_applied = True
                 continue
-            elif action == "remove_redundant_hierarchy_layer" and c["allow_hierarchy_removal"]:
-                ok = self._remove_state(D, gf, state, min_states=c["min_states"])
+            elif (action == "remove_redundant_hierarchy_layer" and c["allow_hierarchy_removal"]
+                    and self._graph_constraint()["allow_state_removal"]):
+                ok = self._remove_state(
+                    D, gf, state, min_states=self._graph_constraint()["min_states"]
+                )
             else:
                 skipped.append({**mutation, "reason": "disabled_or_unsupported"})
                 continue

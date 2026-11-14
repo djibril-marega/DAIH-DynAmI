@@ -87,7 +87,8 @@ class OfflineConfig:
     neuron_step: int = 16
     world_model_min_neurons: int = 64
     world_model_max_neurons: int = 512
-    max_total_states: int | None = 64
+    max_total_states: int | None = 64  # Legacy global safety cap; graph_constraints.max_states is preferred.
+    graph_constraints: dict[str, Any] = field(default_factory=dict)
     state_constraints: dict[str, dict[str, Any]] = field(default_factory=dict)
     checkpoint_dir: str | None = "offline_artifacts"
     plan_filename: str = "offline_plan.json"
@@ -175,7 +176,30 @@ class OfflineTrainer:
             raise ValueError("world_model_min_neurons must be >= 16.")
         if self.config.world_model_max_neurons < self.config.world_model_min_neurons:
             raise ValueError("world_model_max_neurons must be >= world_model_min_neurons.")
+        graph_constraints = self.config.graph_constraints
+        min_states = int(graph_constraints.get("min_states", 1))
+        max_states = graph_constraints.get("max_states")
+        if min_states < 1 or (max_states is not None and int(max_states) < min_states):
+            raise ValueError(
+                "Invalid graph state-count bounds: "
+                "require 1 <= graph_constraints['min_states'] <= "
+                "graph_constraints['max_states'] (or None)."
+            )
+        if (self.config.max_total_states is not None
+                and int(self.config.max_total_states) < min_states):
+            raise ValueError("max_total_states must be >= graph_constraints.min_states.")
+
+        graph_level_keys = {
+            "min_states", "max_states", "allow_state_addition", "allow_state_removal"
+        }
         for state_name, constraints in self.config.state_constraints.items():
+            misplaced = graph_level_keys.intersection(constraints)
+            if misplaced:
+                names = ", ".join(sorted(misplaced))
+                raise ValueError(
+                    f"Graph-level constraints ({names}) must be declared in "
+                    "graph_constraints, not state_constraints."
+                )
             min_coordinates = int(constraints.get("min_coordinates", 1))
             max_coordinates = constraints.get("max_coordinates")
             min_under_state = int(constraints.get(
@@ -184,8 +208,6 @@ class OfflineTrainer:
             max_under_state = constraints.get(
                 "max_under_state", constraints.get("max_size")
             )
-            min_states = int(constraints.get("min_states", 1))
-            max_states = constraints.get("max_states")
             if min_coordinates < 1 or (max_coordinates is not None
                     and int(max_coordinates) < min_coordinates):
                 raise ValueError(
@@ -197,12 +219,6 @@ class OfflineTrainer:
                 raise ValueError(
                     f"Invalid under_state bounds for state {state_name!r}: "
                     "require 1 <= min_under_state <= max_under_state (or None)."
-                )
-            if min_states < 1 or (max_states is not None
-                    and int(max_states) < min_states):
-                raise ValueError(
-                    f"Invalid state-count bounds for {state_name!r}: "
-                    "require 1 <= min_states <= max_states (or None)."
                 )
         if not 0.0 <= self.config.policy_baseline_momentum < 1.0:
             raise ValueError("policy_baseline_momentum must be in [0, 1).")
