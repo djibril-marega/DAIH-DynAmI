@@ -27,7 +27,7 @@ class OfflineArchitecture:
         defaults = {
             "allow_neurons": True,
             "allow_intermediate_layers": True,
-            "allow_coordinates": True,
+            "allow_under_state": True,
             "allow_state_addition": True,
             "allow_state_removal": True,
             "allow_hierarchy_addition": True,
@@ -53,7 +53,7 @@ class OfflineArchitecture:
         if isinstance(value, (tuple, list)):
             # A list is interpreted as a shape template, matching the
             # corresponding mu layout: [0] -> one coordinate and
-            # [[0, 0], [0, 0]] -> two coordinates per order.
+            # [[0, 0], [0, 0]] -> two under_state per order.
             if not value:
                 return default
             last_axis = value[-1]
@@ -62,7 +62,7 @@ class OfflineArchitecture:
 
     @staticmethod
     def _current_state_parameters(agent) -> dict:
-        """Use current posterior means/variances as the next D initialization."""
+        """Use current posterior means/variances as the next D initialization.""" # under_state
         result = deepcopy(agent.D)
         for name, distributions in agent.Q_.items():
             means, variances = [], []
@@ -95,18 +95,18 @@ class OfflineArchitecture:
             tensor = tensor[:, :-1]
         return tensor.squeeze(-1).tolist() if squeeze else tensor.tolist()
 
-    def _mutate_coordinates(self, D, state_name: str, add: bool):
+    def _mutate_under_state(self, D, state_name: str, add: bool):
         c = self._constraint(state_name)
         mu = torch.as_tensor(D[state_name]["mu"], dtype=torch.float32)
         if mu.ndim == 1:
-            coordinate_count = 1
+            under_state_count = 1
         else:
-            coordinate_count = mu.shape[-1]
-        min_size = self._dimension_limit(c.get("min_size"), "coordinates", 1)
-        max_size = self._dimension_limit(c.get("max_size"), "coordinates", None)
-        if add and max_size is not None and coordinate_count >= int(max_size):
+            under_state_count = mu.shape[-1]
+        min_size = self._dimension_limit(c.get("min_size"), "under_state", 1)
+        max_size = self._dimension_limit(c.get("max_size"), "under_state", None)
+        if add and max_size is not None and under_state_count >= int(max_size):
             return False
-        if not add and coordinate_count <= int(min_size):
+        if not add and under_state_count <= int(min_size):
             return False
 
         variance = D[state_name].get("variance")
@@ -661,10 +661,10 @@ class OfflineArchitecture:
                         "layer_id": layer_id,
                         "layers": current_layers + (1 if action == "add_intermediate_layer" else -1),
                     })
-            elif action == "add_generalized_coordinate" and c["allow_coordinates"]:
-                ok = self._mutate_coordinates(D, state, True)
-            elif action == "remove_low_utility_coordinate" and c["allow_coordinates"]:
-                ok = self._mutate_coordinates(D, state, False)
+            elif action == "add_generalized_coordinate" and c["allow_under_state"]:
+                ok = self._mutate_under_state(D, state, True)
+            elif action == "remove_low_utility_coordinate" and c["allow_under_state"]:
+                ok = self._mutate_under_state(D, state, False)
             elif action == "add_state" and c["allow_state_addition"]:
                 new_name = self._add_state(D, gf, state, hierarchy=False)
                 if new_name is None:
@@ -771,7 +771,7 @@ class OfflineArchitecture:
 
         Equal-sized distributions are copied exactly (including full MVN
         covariance). If a state's coordinate count changed, the overlapping
-        means/covariance block is retained and only newly added coordinates
+        means/covariance block is retained and only newly added under_state
         keep their D-derived initialization.
         """
         if not old_Q:
@@ -888,7 +888,7 @@ class OfflineArchitecture:
         agent.pi_states = preserved_pi
 
         # Existing Q entries survive the rebuild; only newly introduced
-        # coordinates/states use D-based initialization.
+        # under_state/states use D-based initialization.
         agent.model(
             generative_functions=gf,
             functions_map=old_functions_map,
