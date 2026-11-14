@@ -156,7 +156,7 @@ class Agent_DAIH():
             observations, 
             self.pi_obs, 
             self.pi_obs_substitued
-        ) = inference.handle_missing_observations(observations, self.pi_obs, self.pi_obs_substitued)
+        ) = preprocessing.handle_missing_observations(observations, self.pi_obs, self.pi_obs_substitued)
 
         for motors in self.beliefs_update(observations):
             yield f"action motor: {motors}"

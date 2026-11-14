@@ -377,7 +377,7 @@ class OfflineTrainer:
                 if self.config.observation_mode == "independent":
                     self._restore_beliefs(initial)
                 prepared = deepcopy(observation)
-                prepared, pi_obs, pi_substituted = inference.handle_missing_observations(
+                prepared, pi_obs, pi_substituted = preprocessing.handle_missing_observations(
                     prepared, deepcopy(self.agent.pi_obs), deepcopy(self.agent.pi_obs_substitued)
                 )
                 self.agent.pi_obs = pi_obs
@@ -402,6 +402,15 @@ class OfflineTrainer:
                 if motor_fn is not None:
                     prepared = self._call_motor(motor_fn, prepared, motors or None)
 
+                prepared, self.agent.pi_obs, self.agent.pi_obs_substitued = (
+                    preprocessing.handle_missing_observations(
+                        prepared,
+                        self.agent.pi_obs,
+                        self.agent.pi_obs_substitued,
+                    )
+                )
+
+                
                 if motor_trace is not None:
                     motor_trace.append({
                         "observation_index": index,

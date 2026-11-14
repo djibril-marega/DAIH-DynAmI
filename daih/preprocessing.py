@@ -1,5 +1,5 @@
 from . import model_components, utils
-import torch, math
+import torch, math, copy
 from collections.abc import Mapping
 
 def preprocessing_layer_for_free_energy(state_name, navigator, functions_map, inputs_map, Q_, pi_priors, pi_obs, observations, states_list):
@@ -642,3 +642,62 @@ def prepare_world_model_inputs(
         kwargs["temperature"] = inputs_map[f"error_{state_name}"]
 
     return kwargs
+
+
+def handle_missing_observations(observations_actual, pi_obs, pi_obs_substitued, low_precision=1e-7, substitute_value=0.0):
+    """
+    Handles missing observations and restores their original precisions.
+
+    Args:
+        observations_actual (dict): Observations grouped by name.
+        pi_obs (dict): Precision of each individual observation.
+        pi_obs_substitued (dict): Backup of original precisions for
+            currently missing observations.
+        low_precision (float): Precision assigned to missing observations.
+        substitute_value (float): Numerical value replacing None.
+
+    Returns:
+        tuple:
+            - observations_actual
+            - pi_obs
+            - pi_obs_substitued
+    """
+
+    for group, observations in observations_actual.items():
+
+        for observation, value in observations.items():
+
+            # --------------------------------------------------
+            # 1. Missing observation
+            # --------------------------------------------------
+            if value is None:
+
+                # Save the original precision only once.
+                if observation not in pi_obs_substitued:
+
+                    if observation in pi_obs:
+                        pi_obs_substitued[observation] = copy.deepcopy(
+                            pi_obs[observation]
+                        )
+
+                # Reduce its influence during inference.
+                pi_obs[observation] = torch.tensor(
+                    low_precision,
+                    dtype=torch.float32
+                )
+
+                # Replace None with a numerical value.
+                observations[observation] = substitute_value
+
+            # --------------------------------------------------
+            # 2. Observation available again
+            # --------------------------------------------------
+            elif observation in pi_obs_substitued:
+
+                # Restore the original precision if it was saved.
+                pi_obs[observation] = pi_obs_substitued.pop(observation)
+
+    return observations_actual, pi_obs, pi_obs_substitued
+
+
+
