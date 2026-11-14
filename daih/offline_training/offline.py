@@ -116,8 +116,9 @@ class OfflineTrainer:
         3: "shared_world_model_capacity",
         4: "state_local_intermediate_layers",
         5: "state_local_generalized_coordinates",
-        6: "agent_states",
-        7: "agent_hierarchy",
+        6: "state_local_under_states",
+        7: "agent_states",
+        8: "agent_hierarchy",
     }
 
     def __init__(self, agent, config: OfflineConfig | dict | None = None):
@@ -174,6 +175,35 @@ class OfflineTrainer:
             raise ValueError("world_model_min_neurons must be >= 16.")
         if self.config.world_model_max_neurons < self.config.world_model_min_neurons:
             raise ValueError("world_model_max_neurons must be >= world_model_min_neurons.")
+        for state_name, constraints in self.config.state_constraints.items():
+            min_coordinates = int(constraints.get("min_coordinates", 1))
+            max_coordinates = constraints.get("max_coordinates")
+            min_under_state = int(constraints.get(
+                "min_under_state", constraints.get("min_size", 1)
+            ))
+            max_under_state = constraints.get(
+                "max_under_state", constraints.get("max_size")
+            )
+            min_states = int(constraints.get("min_states", 1))
+            max_states = constraints.get("max_states")
+            if min_coordinates < 1 or (max_coordinates is not None
+                    and int(max_coordinates) < min_coordinates):
+                raise ValueError(
+                    f"Invalid coordinate bounds for state {state_name!r}: "
+                    "require 1 <= min_coordinates <= max_coordinates (or None)."
+                )
+            if min_under_state < 1 or (max_under_state is not None
+                    and int(max_under_state) < min_under_state):
+                raise ValueError(
+                    f"Invalid under_state bounds for state {state_name!r}: "
+                    "require 1 <= min_under_state <= max_under_state (or None)."
+                )
+            if min_states < 1 or (max_states is not None
+                    and int(max_states) < min_states):
+                raise ValueError(
+                    f"Invalid state-count bounds for {state_name!r}: "
+                    "require 1 <= min_states <= max_states (or None)."
+                )
         if not 0.0 <= self.config.policy_baseline_momentum < 1.0:
             raise ValueError("policy_baseline_momentum must be in [0, 1).")
         if self.config.policy_learning_rate is not None and self.config.policy_learning_rate <= 0:
@@ -250,12 +280,15 @@ class OfflineTrainer:
         for metric in global_item.get("history", []):
             self.global_progress.history.append(StateMetrics(**metric))
         self.progress = {}
-        # Earlier versions stored all seven phases per state. This version has shared phases 1-3,
-        # so old per-state phase counters cannot be migrated unambiguously.
+        # Older controller versions had seven local phases: their phase 6
+        # (states) and phase 7 (hierarchy) shift to 7 and 8 after inserting the
+        # independent under_state phase at position 6.
         legacy_progress = {} if legacy_controller_state else state.get("progress", {})
         for name, item in legacy_progress.items():
+            saved_phase = int(item.get("phase", 1))
+            migrated_phase = saved_phase + 1 if saved_phase >= 6 else saved_phase
             progress = StateProgress(
-                phase=int(item.get("phase", 1)),
+                phase=migrated_phase,
                 history=deque(maxlen=self.config.derivative_window),
                 stable=bool(item.get("stable", False)),
                 pending_mutation=bool(item.get("pending_mutation", False)),
@@ -873,7 +906,7 @@ class OfflineTrainer:
         return finite_float(total), metrics
 
     # ------------------------------------------------------------------
-    # Seven-phase per-state decision system
+    # Eight-phase per-state decision system
     # ------------------------------------------------------------------
 
     @staticmethod
@@ -970,8 +1003,9 @@ class OfflineTrainer:
                 3: {"action": "prune_neurons", "target": state_name},
                 4: {"action": "prune_intermediate_layer", "target": state_name},
                 5: {"action": "remove_low_utility_coordinate", "target": state_name},
-                6: {"action": "remove_redundant_state", "target": state_name},
-                7: {"action": "remove_redundant_hierarchy_layer", "target": state_name},
+                6: {"action": "remove_under_state", "target": state_name},
+                7: {"action": "remove_redundant_state", "target": state_name},
+                8: {"action": "remove_redundant_hierarchy_layer", "target": state_name},
             }
             return operations.get(phase, {"action": "none", "target": state_name})
 
@@ -979,8 +1013,9 @@ class OfflineTrainer:
             3: {"action": "add_neurons", "target": state_name},
             4: {"action": "add_intermediate_layer", "target": state_name},
             5: {"action": "add_generalized_coordinate", "target": state_name},
-            6: {"action": "add_state", "target": state_name},
-            7: {"action": "add_hierarchy_layer", "target": state_name},
+            6: {"action": "add_under_state", "target": state_name},
+            7: {"action": "add_state", "target": state_name},
+            8: {"action": "add_hierarchy_layer", "target": state_name},
         }
         return operations.get(phase, {"action": "none", "target": state_name})
 
@@ -1044,7 +1079,7 @@ class OfflineTrainer:
         if self.config.weights_only:
             return ({"world_model": {
                 "phase": self.global_progress.phase,
-                "phase_name": self.PHASE_NAMES[min(self.global_progress.phase, 7)],
+                "phase_name": self.PHASE_NAMES[min(self.global_progress.phase, 8)],
                 "weights_only": True,
                 "mutation": None,
             }}, proposed)
@@ -1263,7 +1298,7 @@ class OfflineTrainer:
                     proposed.append(operation)
                     progress.pending_mutation = True
             elif shock_trigger:
-                if progress.phase < 7:
+                if progress.phase < 8:
                     progress.phase += 1
                     progress.phase_iterations = 0
                     progress.phase_entry_free_energy = metric.free_energy
@@ -1276,7 +1311,7 @@ class OfflineTrainer:
                         proposed.append(operation)
                         progress.pending_mutation = True
 
-            if (progress.phase == 7 and not shock_trigger and not progress.pending_mutation
+            if (progress.phase == 8 and not shock_trigger and not progress.pending_mutation
                     and len(progress.history) >= self.config.patience):
                 progress.stable = True
 
@@ -1616,7 +1651,7 @@ class OfflineTrainer:
                 elif target in self.progress:
                     local_progress = self.progress[target]
                     local_progress.pending_mutation = False
-                    if local_progress.phase < 7:
+                    if local_progress.phase < 8:
                         # A disabled, capped or inapplicable dimension is
                         # skipped; it must not freeze the state before later
                         # structural levels are considered.

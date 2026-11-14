@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 from copy import deepcopy
-from typing import Any
 
 import torch
 from torch import nn
@@ -27,13 +26,16 @@ class OfflineArchitecture:
         defaults = {
             "allow_neurons": True,
             "allow_intermediate_layers": True,
+            "allow_coordinates": True,
             "allow_under_state": True,
             "allow_state_addition": True,
             "allow_state_removal": True,
             "allow_hierarchy_addition": True,
             "allow_hierarchy_removal": True,
-            "min_size": 1,
-            "max_size": None,
+            "min_coordinates": 1,
+            "max_coordinates": None,
+            "min_under_state": 1,
+            "max_under_state": None,
             "min_neurons": 16,
             "max_neurons": 1024,
             "min_intermediate_layers": 0,
@@ -41,24 +43,14 @@ class OfflineArchitecture:
             "min_states": 1,
             "max_states": None,
         }
-        defaults.update(self.config.state_constraints.get(state_name, {}))
+        supplied = self.config.state_constraints.get(state_name, {})
+        defaults.update(supplied)
+        # Backward compatibility: old size bounds controlled the second axis.
+        if "min_under_state" not in supplied and "min_size" in supplied:
+            defaults["min_under_state"] = supplied["min_size"]
+        if "max_under_state" not in supplied and "max_size" in supplied:
+            defaults["max_under_state"] = supplied["max_size"]
         return defaults
-
-    @staticmethod
-    def _dimension_limit(value: Any, key: str, default):
-        if value is None:
-            return default
-        if isinstance(value, dict):
-            return value.get(key, default)
-        if isinstance(value, (tuple, list)):
-            # A list is interpreted as a shape template, matching the
-            # corresponding mu layout: [0] -> one coordinate and
-            # [[0, 0], [0, 0]] -> two under_state per order.
-            if not value:
-                return default
-            last_axis = value[-1]
-            return len(last_axis) if isinstance(last_axis, (tuple, list)) else len(value)
-        return int(value)
 
     @staticmethod
     def _current_state_parameters(agent) -> dict:
@@ -81,43 +73,150 @@ class OfflineArchitecture:
         return result
 
     @staticmethod
-    def _resize_tensor_rows(values, add: bool, fill_value):
+    def _state_matrix(values, *, state_name: str = "<unknown>") -> torch.Tensor:
+        """Normalize D[state] moments to [coordinates, under_state].
+
+        A legacy 1D vector represents one coordinate with several under-states.
+        A 2D tensor uses rows for generalized coordinates and columns for
+        under-states. No other layout is accepted.
+        """
         tensor = torch.as_tensor(values, dtype=torch.float32)
         if tensor.ndim == 1:
-            tensor = tensor.unsqueeze(-1)
-            squeeze = True
-        else:
-            squeeze = False
-        if add:
-            extra = torch.full((tensor.shape[0], 1), float(fill_value), dtype=tensor.dtype)
-            tensor = torch.cat([tensor, extra], dim=1)
-        else:
-            tensor = tensor[:, :-1]
-        return tensor.squeeze(-1).tolist() if squeeze else tensor.tolist()
+            tensor = tensor.unsqueeze(0)
+        elif tensor.ndim != 2:
+            raise ValueError(
+                f"D[{state_name!r}] moments must have shape [under_state] or "
+                f"[coordinates, under_state]; received {tuple(tensor.shape)}."
+            )
+        if tensor.shape[0] < 1 or tensor.shape[1] < 1:
+            raise ValueError(
+                f"D[{state_name!r}] must contain at least one coordinate "
+                "and one under_state."
+            )
+        return tensor
 
-    def _mutate_under_state(self, D, state_name: str, add: bool):
-        c = self._constraint(state_name)
-        mu = torch.as_tensor(D[state_name]["mu"], dtype=torch.float32)
-        if mu.ndim == 1:
-            under_state_count = 1
+    @classmethod
+    def _coordinate_count(cls, values) -> int:
+        """Number of generalized coordinates (matrix rows)."""
+        return int(cls._state_matrix(values).shape[0])
+
+    @classmethod
+    def _under_state_count(cls, values) -> int:
+        """Number of under-states (matrix columns)."""
+        return int(cls._state_matrix(values).shape[1])
+
+    @classmethod
+    def _resize_coordinates(cls, values, add: bool, fill_value, *, state_name: str):
+        """Add/remove a row: generalized coordinates are the first axis."""
+        tensor = cls._state_matrix(values, state_name=state_name)
+        if add:
+            extra = torch.full(
+                (1, tensor.shape[1]), float(fill_value), dtype=tensor.dtype,
+                device=tensor.device,
+            )
+            tensor = torch.cat((tensor, extra), dim=0)
         else:
-            under_state_count = mu.shape[-1]
-        min_size = self._dimension_limit(c.get("min_size"), "under_state", 1)
-        max_size = self._dimension_limit(c.get("max_size"), "under_state", None)
-        if add and max_size is not None and under_state_count >= int(max_size):
+            if tensor.shape[0] <= 1:
+                raise ValueError("Cannot remove the only generalized coordinate.")
+            tensor = tensor[:-1, :]
+        # Preserve the legacy vector only for exactly one coordinate.
+        if tensor.shape[0] == 1:
+            tensor = tensor.squeeze(0)
+        return tensor.tolist()
+
+    @classmethod
+    def _resize_under_states(cls, values, add: bool, fill_value, *, state_name: str):
+        """Add/remove a column: under-states are the second axis."""
+        tensor = cls._state_matrix(values, state_name=state_name)
+        if add:
+            extra = torch.full(
+                (tensor.shape[0], 1), float(fill_value), dtype=tensor.dtype,
+                device=tensor.device,
+            )
+            tensor = torch.cat((tensor, extra), dim=1)
+        else:
+            if tensor.shape[1] <= 1:
+                raise ValueError("Cannot remove the only under_state.")
+            tensor = tensor[:, :-1]
+        # One coordinate remains representable as a legacy 1D vector.
+        if tensor.shape[0] == 1:
+            tensor = tensor.squeeze(0)
+        return tensor.tolist()
+
+    def _mutate_coordinates(self, D, state_name: str, add: bool):
+        c = self._constraint(state_name)
+        mu = self._state_matrix(D[state_name]["mu"], state_name=state_name)
+        coordinate_count = int(mu.shape[0])
+        min_count = int(c["min_coordinates"])
+        max_count = c["max_coordinates"]
+        if add and max_count is not None and coordinate_count >= int(max_count):
             return False
-        if not add and under_state_count <= int(min_size):
+        if not add and coordinate_count <= min_count:
             return False
 
         variance = D[state_name].get("variance")
         if variance is None:
             variance = torch.ones_like(mu).tolist()
-        if add:
-            D[state_name]["mu"] = self._resize_tensor_rows(D[state_name]["mu"], True, 0.0)
-            D[state_name]["variance"] = self._resize_tensor_rows(variance, True, 1.0)
-        else:
-            D[state_name]["mu"] = self._resize_tensor_rows(D[state_name]["mu"], False, 0.0)
-            D[state_name]["variance"] = self._resize_tensor_rows(variance, False, 1.0)
+        variance_tensor = self._state_matrix(variance, state_name=state_name)
+        if variance_tensor.shape != mu.shape:
+            raise ValueError(
+                f"Variance shape {tuple(variance_tensor.shape)} does not match "
+                f"mu shape {tuple(mu.shape)} for state {state_name!r}."
+            )
+
+        next_mu = self._resize_coordinates(
+            D[state_name]["mu"], add, 0.0, state_name=state_name
+        )
+        next_variance = self._resize_coordinates(
+            variance, add, 1.0, state_name=state_name
+        )
+        expected = coordinate_count + (1 if add else -1)
+        if self._coordinate_count(next_mu) != expected:
+            raise RuntimeError(
+                f"Coordinate mutation for {state_name!r} did not produce "
+                f"the expected row count {expected}."
+            )
+        D[state_name]["mu"] = next_mu
+        D[state_name]["variance"] = next_variance
+        D[state_name].pop("covariance", None)
+        return True
+
+    def _mustate_under_state(self, D, state_name: str, add: bool):
+        """Mutate under-state columns, independently of coordinate rows."""
+        c = self._constraint(state_name)
+        mu = self._state_matrix(D[state_name]["mu"], state_name=state_name)
+        under_state_count = int(mu.shape[1])
+        min_count = int(c["min_under_state"])
+        max_count = c["max_under_state"]
+        if add and max_count is not None and under_state_count >= int(max_count):
+            return False
+        if not add and under_state_count <= min_count:
+            return False
+
+        variance = D[state_name].get("variance")
+        if variance is None:
+            variance = torch.ones_like(mu).tolist()
+        variance_tensor = self._state_matrix(variance, state_name=state_name)
+        if variance_tensor.shape != mu.shape:
+            raise ValueError(
+                f"Variance shape {tuple(variance_tensor.shape)} does not match "
+                f"mu shape {tuple(mu.shape)} for state {state_name!r}."
+            )
+
+        next_mu = self._resize_under_states(
+            D[state_name]["mu"], add, 0.0, state_name=state_name
+        )
+        next_variance = self._resize_under_states(
+            variance, add, 1.0, state_name=state_name
+        )
+        expected = under_state_count + (1 if add else -1)
+        if self._under_state_count(next_mu) != expected:
+            raise RuntimeError(
+                f"Under-state mutation for {state_name!r} did not produce "
+                f"the expected column count {expected}."
+            )
+        D[state_name]["mu"] = next_mu
+        D[state_name]["variance"] = next_variance
         D[state_name].pop("covariance", None)
         return True
 
@@ -593,6 +692,15 @@ class OfflineArchitecture:
         # Preserve the actual posterior, not the original arbitrary D values.
         D = self._current_state_parameters(self.agent)
         gf = deepcopy(self.agent.generative_functions)
+        state_count_before = len(self.agent.states_list)
+        coordinate_counts_before = {
+            name: self._coordinate_count(spec["mu"])
+            for name, spec in D.items()
+        }
+        under_state_counts_before = {
+            name: self._under_state_count(spec["mu"])
+            for name, spec in D.items()
+        }
         applied, skipped = [], []
         world_neuron_delta = 0
         local_layer_changes = []
@@ -661,10 +769,50 @@ class OfflineArchitecture:
                         "layer_id": layer_id,
                         "layers": current_layers + (1 if action == "add_intermediate_layer" else -1),
                     })
-            elif action == "add_generalized_coordinate" and c["allow_under_state"]:
-                ok = self._mutate_under_state(D, state, True)
-            elif action == "remove_low_utility_coordinate" and c["allow_under_state"]:
-                ok = self._mutate_under_state(D, state, False)
+            elif action == "add_generalized_coordinate" and c["allow_coordinates"]:
+                count_before = self._coordinate_count(D[state]["mu"])
+                ok = self._mutate_coordinates(D, state, True)
+                if ok:
+                    applied.append({
+                        **mutation,
+                        "coordinate_count_before": count_before,
+                        "coordinate_count_after": self._coordinate_count(D[state]["mu"]),
+                    })
+                    structural_applied = True
+                    continue
+            elif action == "remove_low_utility_coordinate" and c["allow_coordinates"]:
+                count_before = self._coordinate_count(D[state]["mu"])
+                ok = self._mutate_coordinates(D, state, False)
+                if ok:
+                    applied.append({
+                        **mutation,
+                        "coordinate_count_before": count_before,
+                        "coordinate_count_after": self._coordinate_count(D[state]["mu"]),
+                    })
+                    structural_applied = True
+                    continue
+            elif action == "add_under_state" and c["allow_under_state"]:
+                count_before = self._under_state_count(D[state]["mu"])
+                ok = self._mustate_under_state(D, state, True)
+                if ok:
+                    applied.append({
+                        **mutation,
+                        "under_state_count_before": count_before,
+                        "under_state_count_after": self._under_state_count(D[state]["mu"]),
+                    })
+                    structural_applied = True
+                    continue
+            elif action == "remove_under_state" and c["allow_under_state"]:
+                count_before = self._under_state_count(D[state]["mu"])
+                ok = self._mustate_under_state(D, state, False)
+                if ok:
+                    applied.append({
+                        **mutation,
+                        "under_state_count_before": count_before,
+                        "under_state_count_after": self._under_state_count(D[state]["mu"]),
+                    })
+                    structural_applied = True
+                    continue
             elif action == "add_state" and c["allow_state_addition"]:
                 new_name = self._add_state(D, gf, state, hierarchy=False)
                 if new_name is None:
@@ -758,11 +906,25 @@ class OfflineArchitecture:
             trainer = getattr(self.agent, "_offline_trainer", None)
             if trainer is not None:
                 trainer.invalidate_optimizer()
+        coordinate_counts_after = {
+            name: self._coordinate_count(spec["mu"])
+            for name, spec in self.agent.D.items()
+        }
+        under_state_counts_after = {
+            name: self._under_state_count(spec["mu"])
+            for name, spec in self.agent.D.items()
+        }
         return {
             "applied": applied,
             "skipped": skipped,
             "rebuilt": rebuilt,
             "local_layer_changes": local_layer_changes,
+            "state_count_before": state_count_before,
+            "state_count_after": len(self.agent.states_list),
+            "coordinate_counts_before": coordinate_counts_before,
+            "coordinate_counts_after": coordinate_counts_after,
+            "under_state_counts_before": under_state_counts_before,
+            "under_state_counts_after": under_state_counts_after,
         }
 
     @staticmethod
@@ -770,9 +932,9 @@ class OfflineArchitecture:
         """Restore existing posterior values after model() rebuilds the graph.
 
         Equal-sized distributions are copied exactly (including full MVN
-        covariance). If a state's coordinate count changed, the overlapping
-        means/covariance block is retained and only newly added under_state
-        keep their D-derived initialization.
+        covariance). When either matrix axis changes, overlapping coordinate
+        distributions and under_state components are retained; newly added
+        rows/columns keep their D-derived initialization.
         """
         if not old_Q:
             return
