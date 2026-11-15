@@ -4,7 +4,7 @@ The shared WorldModel is optimized against the sum of all state free energies.
 Policy generators are optimized separately with expected-free-energy policy
  gradients and a G_prior/G_posterior alignment loss. The controller has one
 shared progression for WorldModel phases 1-3 and independent per-state
-progression for agent-architecture phases 4-7.
+progression for agent-architecture phases 4-8.
 
 Offline learning performs temporary per-observation inference, then restores persistent posterior beliefs Q and online observation precisions.
 """
@@ -14,7 +14,7 @@ from collections import defaultdict, deque
 from copy import deepcopy
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Iterable
+from typing import Any, Callable
 from contextlib import contextmanager
 import json
 import math
@@ -79,6 +79,7 @@ class OfflineConfig:
     # to the user-provided motor_train_fn callback.
     train_motor: bool = False
     weights_only: bool = False  # disables all architecture/phase mutations
+    max_phase: int = 8  # cumulative phase ceiling: 3 means phases 1, 2 and 3
     policy_learning_rate: float | None = None
     policy_efe_weight: float = 1.0
     policy_alignment_weight: float = 1.0
@@ -172,6 +173,8 @@ class OfflineTrainer:
             raise ValueError("shock_threshold must be >= 0 and shock_window >= 2.")
         if self.config.phase_min_iterations < 1:
             raise ValueError("phase_min_iterations must be >= 1.")
+        if not 1 <= int(self.config.max_phase) <= 8:
+            raise ValueError("max_phase must be an integer between 1 and 8.")
         if self.config.world_model_min_neurons < 16:
             raise ValueError("world_model_min_neurons must be >= 16.")
         if self.config.world_model_max_neurons < self.config.world_model_min_neurons:
@@ -364,33 +367,13 @@ class OfflineTrainer:
 
     @staticmethod
     def _normalize_observations(observations: Any) -> list[dict]:
-        """Normalize one bounded training window.
-
-        Any iterable of observation dictionaries is accepted, including a
-        generator. The iterable is materialized only for the current window;
-        callers should therefore feed bounded generators rather than an
-        entire multi-gigabyte dataset.
-        """
         if isinstance(observations, dict):
             return [deepcopy(observations)]
-        if observations is None or isinstance(observations, (str, bytes)):
-            raise TypeError("observations must be a dict or an iterable of dictionaries.")
-        try:
-            frames = []
-            for index, item in enumerate(observations):
-                if not isinstance(item, dict):
-                    raise TypeError(
-                        f"Observation #{index} must be a dictionary, got "
-                        f"{type(item).__name__}."
-                    )
-                frames.append(deepcopy(item))
-        except TypeError:
-            raise
-        except Exception as exc:
-            raise TypeError("Could not consume the observations iterable.") from exc
-        if not frames:
-            raise ValueError("The observations iterable is empty.")
-        return frames
+        if isinstance(observations, (list, tuple)) and observations:
+            if not all(isinstance(item, dict) for item in observations):
+                raise TypeError("A sequence dataset must contain dictionaries, one per observation.")
+            return [deepcopy(item) for item in observations]
+        raise TypeError("observations must be a dictionary or a non-empty sequence of dictionaries.")
 
     @staticmethod
     def _reset_motor(motor_fn: Callable | None, initial_observation: dict) -> None:
@@ -952,7 +935,7 @@ class OfflineTrainer:
         return finite_float(total), metrics
 
     # ------------------------------------------------------------------
-    # Eight-phase per-state decision system
+    # Eight-phase adaptive decision system
     # ------------------------------------------------------------------
 
     @staticmethod
@@ -1122,6 +1105,12 @@ class OfflineTrainer:
     def _update_progress(self, metrics: dict[str, StateMetrics]):
         decisions = {}
         proposed = []
+        max_phase = int(self.config.max_phase)
+        # A resumed controller may have been saved at a later phase. Respect
+        # the current CLI ceiling without resetting learned model parameters.
+        self.global_progress.phase = min(self.global_progress.phase, max_phase if max_phase < 4 else 4)
+        for item in self.progress.values():
+            item.phase = min(item.phase, max_phase)
         if self.config.weights_only:
             return ({"world_model": {
                 "phase": self.global_progress.phase,
@@ -1213,7 +1202,7 @@ class OfflineTrainer:
                     proposed.append(global_operation)
                     global_state.pending_mutation = True
             elif global_transition:
-                if global_state.phase < 3:
+                if global_state.phase < min(3, max_phase):
                     global_state.phase += 1
                     global_state.phase_iterations = 0
                     global_state.phase_entry_free_energy = aggregate.free_energy
@@ -1232,9 +1221,9 @@ class OfflineTrainer:
                         global_operation["scope"] = "world_model"
                         proposed.append(global_operation)
                         global_state.pending_mutation = True
-                else:
-                    # Shared representation is considered sufficiently explored.
-                    # Subsequent architecture decisions are local to each state.
+                elif global_state.phase == 3 and max_phase >= 4:
+                    # Shared representation is sufficiently explored; local
+                    # architecture phases are enabled only when requested.
                     global_state.phase = 4
                     global_state.phase_iterations = 0
                     global_state.phase_entry_free_energy = aggregate.free_energy
@@ -1242,6 +1231,8 @@ class OfflineTrainer:
                     global_state.history.clear()
                     global_state.history.append(aggregate)
                     self._initialize_local_phases(metrics)
+                # At the selected ceiling, remain in that phase. Optimization
+                # and same-phase maintenance can continue, but later phases cannot start.
 
             decisions["world_model"] = {
                 "phase_before": global_phase_before,
@@ -1263,7 +1254,7 @@ class OfflineTrainer:
                 return decisions, proposed
 
         # --------------------------------------------------------------
-        # Agent architecture: phases 4-7 are controlled independently per state.
+        # Agent architecture: phases 4-8 are controlled independently per state.
         # --------------------------------------------------------------
         self._initialize_local_phases(metrics)
         for state_name, metric in metrics.items():
@@ -1350,7 +1341,7 @@ class OfflineTrainer:
                     proposed.append(operation)
                     progress.pending_mutation = True
             elif shock_trigger:
-                if progress.phase < 8:
+                if progress.phase < min(8, max_phase):
                     progress.phase += 1
                     progress.phase_iterations = 0
                     progress.phase_entry_free_energy = metric.free_energy
@@ -1363,7 +1354,7 @@ class OfflineTrainer:
                         proposed.append(operation)
                         progress.pending_mutation = True
 
-            if (progress.phase == 8 and not shock_trigger and not progress.pending_mutation
+            if (progress.phase == min(8, max_phase) and not shock_trigger and not progress.pending_mutation
                     and len(progress.history) >= self.config.patience):
                 progress.stable = True
 
@@ -1548,9 +1539,9 @@ class OfflineTrainer:
 
     def step(
         self,
-        observations: Any,
+        observations: dict | list[dict] | tuple[dict, ...],
         *,
-        test_observations: Any = None,
+        test_observations: dict | list[dict] | tuple[dict, ...] | None = None,
         rebuild_callback: Callable | None = None,
         motor_fn: Callable | None = None,
         motor_train_fn: Callable | None = None,
@@ -1558,13 +1549,9 @@ class OfflineTrainer:
         self._validate_config()
         if self.agent.navigator is None:
             raise RuntimeError("Call Agent_DAIH.model() before training_offline().")
-        # Consume a possibly one-shot generator exactly once. When no held-out
-        # stream is supplied, the bounded training window is also the test set.
         training_frames = self._normalize_observations(observations)
-        test_frames = (
-            training_frames
-            if test_observations is None
-            else self._normalize_observations(test_observations)
+        test_frames = self._normalize_observations(
+            test_observations if test_observations is not None else observations
         )
         if self.config.train_motor and motor_fn is None:
             raise ValueError("train_motor=True requires a user-supplied motor_fn.")
@@ -1638,7 +1625,11 @@ class OfflineTrainer:
 
         decisions, proposed = self._update_progress(metrics_after)
         plan = {
-            "version": "7.1",
+            "version": "7.2",
+            "max_phase": int(self.config.max_phase),
+            "weights_only": bool(self.config.weights_only),
+            "train_world_model": bool(self.config.train_world_model),
+            "train_policy": bool(self.config.train_policy),
             "observation_mode": self.config.observation_mode,
             "observations_processed": len(training_frames),
             "phase_transition_mode": self.config.phase_transition_mode,
@@ -1698,19 +1689,21 @@ class OfflineTrainer:
                 target = skipped_mutation.get("target")
                 if skipped_mutation.get("scope") == "world_model":
                     self.global_progress.pending_mutation = False
-                    if self.global_progress.phase < 4:
+                    if self.global_progress.phase < min(3, int(self.config.max_phase)):
                         self.global_progress.phase += 1
                         self.global_progress.phase_iterations = 0
                         self.global_progress.history.clear()
-                        if self.global_progress.phase >= 4:
-                            self._initialize_local_phases(metrics_after)
+                    elif self.global_progress.phase == 3 and int(self.config.max_phase) >= 4:
+                        self.global_progress.phase = 4
+                        self.global_progress.phase_iterations = 0
+                        self.global_progress.history.clear()
+                        self._initialize_local_phases(metrics_after)
                 elif target in self.progress:
                     local_progress = self.progress[target]
                     local_progress.pending_mutation = False
-                    if local_progress.phase < 8:
-                        # A disabled, capped or inapplicable dimension is
-                        # skipped; it must not freeze the state before later
-                        # structural levels are considered.
+                    if local_progress.phase < min(8, int(self.config.max_phase)):
+                        # A disabled or inapplicable dimension is skipped, but
+                        # never advance beyond the phase ceiling selected by CLI.
                         local_progress.phase += 1
                         local_progress.phase_iterations = 0
                         local_progress.phase_entry_free_energy = (
