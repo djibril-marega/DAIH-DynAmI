@@ -11,6 +11,7 @@ Offline learning performs temporary per-observation inference, then restores per
 from __future__ import annotations
 
 from collections import defaultdict, deque
+from collections.abc import Iterable
 from copy import deepcopy
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -367,13 +368,25 @@ class OfflineTrainer:
 
     @staticmethod
     def _normalize_observations(observations: Any) -> list[dict]:
+        """Materialize one batch of observations from a dict or iterable of dicts.
+
+        Dataset loaders may provide generators to avoid building an additional
+        intermediate list. A training step needs to replay the same batch for
+        evaluation and optimization, so the iterable is materialized exactly
+        once here.
+        """
         if isinstance(observations, dict):
             return [deepcopy(observations)]
-        if isinstance(observations, (list, tuple)) and observations:
-            if not all(isinstance(item, dict) for item in observations):
-                raise TypeError("A sequence dataset must contain dictionaries, one per observation.")
-            return [deepcopy(item) for item in observations]
-        raise TypeError("observations must be a dictionary or a non-empty sequence of dictionaries.")
+        if isinstance(observations, (str, bytes)) or not isinstance(observations, Iterable):
+            raise TypeError(
+                "observations must be a dictionary or a non-empty iterable of dictionaries."
+            )
+        frames = list(observations)
+        if not frames:
+            raise TypeError("observations must be a dictionary or a non-empty iterable of dictionaries.")
+        if not all(isinstance(item, dict) for item in frames):
+            raise TypeError("An observations iterable must contain dictionaries, one per observation.")
+        return [deepcopy(item) for item in frames]
 
     @staticmethod
     def _reset_motor(motor_fn: Callable | None, initial_observation: dict) -> None:
@@ -1550,8 +1563,13 @@ class OfflineTrainer:
         if self.agent.navigator is None:
             raise RuntimeError("Call Agent_DAIH.model() before training_offline().")
         training_frames = self._normalize_observations(observations)
-        test_frames = self._normalize_observations(
-            test_observations if test_observations is not None else observations
+        # When no explicit test set is supplied, reuse the already materialized
+        # batch. This is essential for one-shot iterators/generators, which
+        # cannot be consumed a second time.
+        test_frames = (
+            training_frames
+            if test_observations is None
+            else self._normalize_observations(test_observations)
         )
         if self.config.train_motor and motor_fn is None:
             raise ValueError("train_motor=True requires a user-supplied motor_fn.")
