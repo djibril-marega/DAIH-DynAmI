@@ -97,7 +97,7 @@ def preprocessing_for_excepted_free_energy(
         local_inputs_map[outputs_f[0]] = temporal_pred
     else:
         for output_f in outputs_f:
-            local_inputs_map[output_f] = temporal_pred
+            local_inputs_map[output_f] = temporal_pred 
 
     transition_cost = model_components.get_transition_cost(navigator, functions_map, local_inputs_map, parent_of_action, states_list, Q_)
     pi_state = pi_states[parent_of_action]
@@ -552,25 +552,45 @@ def prepare_world_model_inputs(
     """
     Prepares arguments intended for WorldModel.forward().
 
-    WorldModel conventions are independent
-    of the input names declared in the graph.
+    For f, g and p, the current state is passed as input.
+    For V, the declared input_V is passed instead.
 
     Actions can be:
         - An individual action.
         - An action group.
     """
 
-    # Current state
-    if state_name not in inputs_map:
-        raise KeyError(
-            f"State '{state_name}' is missing from inputs_map."
-        )
+    # Input tensor
+    if function_type == "V":
 
-    state = inputs_map[state_name]
+        if len(input_names) != 1:
+            raise ValueError(
+                f"Expected exactly one input_V for '{state_name}', "
+                f"but found {len(input_names)}: {input_names}."
+            )
+
+        input_name = input_names[0]
+
+        if input_name not in inputs_map:
+            raise KeyError(
+                f"V input '{input_name}' for state '{state_name}' "
+                "is missing from inputs_map."
+            )
+
+        state = inputs_map[input_name]
+
+    else:
+
+        if state_name not in inputs_map:
+            raise KeyError(
+                f"State '{state_name}' is missing from inputs_map."
+            )
+
+        state = inputs_map[state_name]
 
     # State identifier
     try:
-        state_id = states_list.index(state_name)+1
+        state_id = states_list.index(state_name) + 1
     except ValueError:
         raise ValueError(
             f"State '{state_name}' is missing from states_list."
@@ -627,17 +647,25 @@ def prepare_world_model_inputs(
         if parameter in input_names and parameter in inputs_map:
             kwargs[parameter] = inputs_map[parameter]
 
-    # g outputs are shaped independently, in the exact order declared by
-    # output_g. Keep output_shape for single-output compatibility.
+    # Output shapes
     if function_type == "g":
         if output_names is None:
-            output_names = get_io_names(navigator, state_name, "g", "output")
-        output_shapes = get_named_output_shapes(navigator, output_names, Q_)
+            output_names = get_io_names(
+                navigator, state_name, "g", "output"
+            )
+
+        output_shapes = get_named_output_shapes(
+            navigator, output_names, Q_
+        )
+
         kwargs["output_shapes"] = output_shapes
+
         if len(output_shapes) == 1:
             kwargs["output_shape"] = output_shapes[0]
+
     elif function_type == "V":
-        kwargs["output_shape"] =  (1, 1)
+        kwargs["output_shape"] = (1, 1)
+
     elif function_type == "p":
         kwargs["temperature"] = inputs_map[f"error_{state_name}"]
 
