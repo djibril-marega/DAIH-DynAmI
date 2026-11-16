@@ -93,6 +93,7 @@ class OfflineConfig:
     graph_constraints: dict[str, Any] = field(default_factory=dict)
     state_constraints: dict[str, dict[str, Any]] = field(default_factory=dict)
     checkpoint_dir: str | None = "offline_artifacts"
+    checkpoint_every: int = 50  # Full "after" checkpoint cadence, in offline steps.
     plan_filename: str = "offline_plan.json"
     checkpoint_filename: str = "offline_before.pt"
     final_checkpoint_filename: str = "offline_after.pt"
@@ -153,6 +154,8 @@ class OfflineTrainer:
         self.best_checkpoint_path: str | None = None
 
     def _validate_config(self) -> None:
+        if self.config.checkpoint_every < 1:
+            raise ValueError("checkpoint_every must be >= 1.")
         if self.config.detection_mode != "current":
             raise ValueError("detection_mode must be 'current'.")
         if self.config.observation_mode not in {"temporal", "independent"}:
@@ -1424,64 +1427,31 @@ class OfflineTrainer:
         return True
 
     def _checkpoint_before(self, F_before: float):
+        """Save the complete initial state once for this run."""
         if not self.config.checkpoint_dir:
             return None
+        from .persistence import save_agent
+
         directory = Path(self.config.checkpoint_dir)
         directory.mkdir(parents=True, exist_ok=True)
         path = directory / self.config.checkpoint_filename
-        state = {
-            "iteration": self.iteration,
-            "F_global_test_before": F_before,
-            "world_model": {
-                key: module.state_dict()
-                for key, module in enumerate(self._unique_modules())
-            },
-            "D": deepcopy(self.agent.D),
-        }
-        torch.save(state, path)
-        return str(path)
+        # Preserve the original starting point if a run is resumed in-place.
+        if path.exists():
+            return str(path)
+        return str(save_agent(self.agent, path))
 
-    def _checkpoint_after(self, F_after: float):
+    def _checkpoint_after(self, F_after: float, *, force: bool = False):
+        """Periodically save a complete resumable state, including trainer/Adam state."""
         if not self.config.checkpoint_dir:
             return None
+        if not force and self.iteration % self.config.checkpoint_every != 0:
+            return None
+        from .persistence import save_agent
+
         directory = Path(self.config.checkpoint_dir)
         directory.mkdir(parents=True, exist_ok=True)
         path = directory / self.config.final_checkpoint_filename
-        state = {
-            "iteration": self.iteration,
-            "F_global_test_after": F_after,
-            "world_model": {
-                str(index): module.state_dict()
-                for index, module in enumerate(self._unique_modules())
-            },
-            "D": deepcopy(self.agent.D),
-            "generative_functions": deepcopy(self.agent.generative_functions),
-            "pi_states": deepcopy(self.agent.pi_states),
-            "pi_obs": deepcopy(self.agent.pi_obs),
-            "global_progress": {
-                "phase": self.global_progress.phase,
-                "stable": self.global_progress.stable,
-                "pending_mutation": self.global_progress.pending_mutation,
-                "phase_iterations": self.global_progress.phase_iterations,
-                "phase_entry_free_energy": self.global_progress.phase_entry_free_energy,
-                "phase_best_free_energy": self.global_progress.phase_best_free_energy,
-                "history": [metric.to_dict() for metric in self.global_progress.history],
-            },
-            "progress": {
-                name: {
-                    "phase": item.phase,
-                    "stable": item.stable,
-                    "pending_mutation": item.pending_mutation,
-                    "phase_iterations": item.phase_iterations,
-                    "phase_entry_free_energy": item.phase_entry_free_energy,
-                    "phase_best_free_energy": item.phase_best_free_energy,
-                    "history": [metric.to_dict() for metric in item.history],
-                }
-                for name, item in self.progress.items()
-            },
-        }
-        torch.save(state, path)
-        return str(path)
+        return str(save_agent(self.agent, path))
 
     def _write_plan(self, plan: dict[str, Any]):
         if not self.config.checkpoint_dir:
