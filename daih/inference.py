@@ -550,7 +550,8 @@ def update_threshold(list_pi_priors, F_list, pi_threshold, dt=0.1, k=1.0):
 
 
 def policy_error(G_prior, G_posterior, pi_p):
-    return torch.clamp(pi_p*((G_prior - G_posterior) ** 2), max=1e+9)
+    delta_G = G_prior - G_posterior
+    return pi_p * delta_G.pow(2)
 
 
 def update_current_action(best_candidat, actions_id, navigator):

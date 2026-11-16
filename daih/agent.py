@@ -43,6 +43,8 @@ class Agent_DAIH():
         # User-supplied factory for state/layer-specific local callables.
         # It is deliberately not serialized; load() receives it explicitly.
         self._local_function_factory = None
+
+        self.min_pi_p = 1e-9
     
     
     def model(self, generative_functions=None, functions_map=None, observations=None, actions=None, pi_p=None):
@@ -290,6 +292,7 @@ class Agent_DAIH():
     
     def policy_selection(self):
         i = 0
+        print("lr_policies: ", self.lr_policies)
         while True:
             i += 1
             if i >= self.max_policies_iter:
@@ -344,22 +347,53 @@ class Agent_DAIH():
                 #print("G_posterior: ", G_posterior)
                 try:
                     pi_p = self.pi_p[state_name].requires_grad_(True)
-                    #print("pi_p: ", pi_p)
-                    error_eps = inference.policy_error(G_prior, G_posterior, pi_p)
-                    #print("error_eps: ", error_eps)
 
-                    if error_eps <= 1:
-                        fist_action = policy_values.policy.policy[0][0]
-                        admited_candidats.append([fist_action, G_posterior])
-                    else: 
-                        self.inputs_map[f"error_{state_name}"] = torch.log(torch.tensor(1+1e-7+error_eps.detach().item()))
+                    error_eps = inference.policy_error(
+                        G_prior,
+                        G_posterior,
+                        pi_p
+                    )
+
+                    print("pi_p:", pi_p)
+                    print("error_eps:", error_eps)
+
+                    if pi_p.item() <= self.min_pi_p:
+                        admitted = True
+                    else:
+                        admitted = error_eps.item() <= 1.0
+
+                    if admitted:
+                        first_action = policy_values.policy.policy[0][0]
+                        admited_candidats.append([first_action, G_posterior])
+
+                    else:
+                        self.inputs_map[f"error_{state_name}"] = torch.log(
+                            torch.tensor(1.0 + error_eps.detach().item())
+                        )
+
                 except UnboundLocalError:
                     pass
 
             # Update Π_P
             try:
-                next_pi_p = utils.update_wih_grad_desc(pi_p, error_eps, dt=0.1, k=self.lr_policies)
-                self.pi_p[state_name] = torch.clamp(next_pi_p, min=1e-9, max=1e+6).detach()
+                pi_p = self.pi_p[state_name].detach().requires_grad_(True)
+
+                error_eps = inference.policy_error(
+                    G_prior, G_posterior, pi_p
+                )
+
+                next_pi_p = utils.update_wih_grad_desc(
+                    pi_p,
+                    error_eps,
+                    dt=0.1,
+                    k=self.lr_policies
+                )
+
+                self.pi_p[state_name] = torch.clamp(
+                    next_pi_p.detach(),
+                    min=1e-9,
+                    max=1e6
+                )
             except UnboundLocalError:
                 print("None policies")
                 break
