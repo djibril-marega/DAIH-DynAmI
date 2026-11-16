@@ -420,62 +420,85 @@ class Agent_DAIH():
             for name, index in motors_indexes
         }
 
-    def training_offline(
-        self,
-        observations,
-        *,
-        test_observations=None,
-        config=None,
-        rebuild_callback=None,
-        motor_fn=None,
-        motor_train_fn=None,
-    ):
-        """
-        Run exactly one global offline-learning iteration.
+    
+def training_offline(
+    self,
+    observations,
+    *,
+    test_observations=None,
+    config=None,
+    rebuild_callback=None,
+    motor_fn=None,
+    motor_train_fn=None,
+):
+    """
+    Run exactly one global offline-learning iteration.
 
-        Parameters
-        ----------
-        observations:
-            Historical observations used for this training iteration.
-        test_observations:
-            Optional held-out observations used to compare global free
-            energy before and after the iteration. Defaults to observations.
-        config:
-            OfflineConfig instance or a dictionary of OfflineConfig values.
-        rebuild_callback:
-            Optional callback that applies the proposed structural plan and
-            returns a new model specification. See README_OFFLINE.md.
-        motor_fn:
-            Optional user-defined callable with signature
-            ``motor_fn(observation, motors)``. It receives a working copy of
-            the observation and the flat motor-output dictionary, or None.
-            It may mutate existing observation fields and return the modified
-            dictionary, or return None after mutating in place.
-        motor_train_fn:
-            Optional user-owned callback receiving (motor_trace,
-            historical_observations). It is called only when
-            OfflineConfig.train_motor is True.
+    Parameters
+    ----------
+    observations:
+        Historical observations used for this training iteration.
+    test_observations:
+        Optional held-out observations used to compare global free
+        energy before and after the iteration. Defaults to observations.
+    config:
+        OfflineConfig instance or a dictionary of OfflineConfig values.
+    rebuild_callback:
+        Optional callback that applies the proposed structural plan and
+        returns a new model specification.
+    motor_fn:
+        Optional user-defined callable with signature
+        motor_fn(observation, motors).
+    motor_train_fn:
+        Optional user-owned callback receiving
+        (motor_trace, historical_observations).
+    """
 
-        Returns
-        -------
-        dict
-            Metrics, per-state phase decisions, proposed mutations and paths.
-        """
-        if self._offline_trainer is None:
-            self._offline_trainer = OfflineTrainer(self, config=config)
-        elif config is not None:
-            # Reusing the same config on every call must NOT reset phase
-            # histories or the global iteration counter.
-
-            self._offline_trainer.config = (
-                config if isinstance(config, OfflineConfig)
-                else OfflineConfig(**config)
-            )
-
-        return self._offline_trainer.step(
-            observations,
-            test_observations=test_observations,
-            rebuild_callback=rebuild_callback,
-            motor_fn=motor_fn,
-            motor_train_fn=motor_train_fn,
+    if self._offline_trainer is None:
+        # First offline training call: create the trainer.
+        self._offline_trainer = OfflineTrainer(
+            self,
+            config=config
         )
+
+    elif config is not None:
+        # Normalize the new configuration.
+        new_config = (
+            config
+            if isinstance(config, OfflineConfig)
+            else OfflineConfig(**config)
+        )
+
+        # Identify the previous and new checkpoint destinations.
+        old_config = self._offline_trainer.config
+
+        old_checkpoint_target = (
+            old_config.checkpoint_dir,
+            old_config.best_checkpoint_filename,
+        )
+
+        new_checkpoint_target = (
+            new_config.checkpoint_dir,
+            new_config.best_checkpoint_filename,
+        )
+
+        # A different checkpoint destination means a new training run.
+        # Reset ONLY the best-model tracking information.
+        if old_checkpoint_target != new_checkpoint_target:
+            self._offline_trainer.best_free_energy = None
+            self._offline_trainer.best_iteration = None
+            self._offline_trainer.best_checkpoint_path = None
+
+        # Preserve the trainer itself, its phase histories,
+        # iteration counter and optimizer states.
+        self._offline_trainer.config = new_config
+
+    # Execute one offline training iteration.
+    return self._offline_trainer.step(
+        observations,
+        test_observations=test_observations,
+        rebuild_callback=rebuild_callback,
+        motor_fn=motor_fn,
+        motor_train_fn=motor_train_fn,
+    )
+
