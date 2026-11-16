@@ -45,6 +45,7 @@ class Agent_DAIH():
         self._local_function_factory = None
 
         self.min_pi_p = 1e-9
+        self.F_global = 0
     
     
     def model(self, generative_functions=None, functions_map=None, observations=None, actions=None, pi_p=None):
@@ -181,6 +182,7 @@ class Agent_DAIH():
     def beliefs_update(self, observations):
         # Retrieve states level by level to start with level 1
         layers_list = self.navigator.layers()
+        self.F_global = 0
         for layer in layers_list:
             states_of_layer = self.navigator.states_by_layer(layer)
             F_layer_list = []
@@ -251,6 +253,7 @@ class Agent_DAIH():
                 F_layer_list.append(F)
                 pi_priors_list.append(prepared["pi_prior"])
 
+                self.F_global += F.detach()
                 if not self.offline:
                     if motors:
                         yield motors
@@ -292,7 +295,6 @@ class Agent_DAIH():
     
     def policy_selection(self):
         i = 0
-        print("lr_policies: ", self.lr_policies)
         while True:
             i += 1
             if i >= self.max_policies_iter:
@@ -353,9 +355,6 @@ class Agent_DAIH():
                         G_posterior,
                         pi_p
                     )
-
-                    print("pi_p:", pi_p)
-                    print("error_eps:", error_eps)
 
                     if pi_p.item() <= self.min_pi_p:
                         admitted = True
