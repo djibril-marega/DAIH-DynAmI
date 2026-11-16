@@ -221,102 +221,16 @@ def get_policy_candidates(navigator, functions_map, inputs_map, state_list, Q_):
     return policy_candidates
 
 
-
 def get_transition_cost(navigator, functions_map, inputs_map, state, states_list, Q_):
     """
-    Recursively propagates g predictions through the hierarchy,
-    collects predicted observations and assigns them to input_V.
-
-    Returns the flattened output of V, or None if V is not defined.
+    Executes V and returns a 1D vector, with outputs flattened and
+    concatenated in output_V order. Returns None if no V is defined.
     """
-
     if navigator.function(state, "V") is None:
         return None
-
-    # Work on a copy to avoid modifying the caller's inputs_map.
-    local_inputs_map = dict(inputs_map)
-
-    predicted_observations = []
-
-    def predict_recursively(current_state):
-        """
-        Executes g for the current state and recursively propagates
-        predictions to its child states.
-        """
-
-        if navigator.function(current_state, "g") is None:
-            raise ValueError(
-                f"No g function is defined for state '{current_state}'."
-            )
-
-        # Execute g and retrieve its outputs by their declared names.
-        named_outputs = preprocessing.execute_named_function(
-            navigator,
-            functions_map,
-            local_inputs_map,
-            current_state,
-            "g",
-            states_list,
-            "g",
-            Q_
-        )
-
-        # Traverse outputs in their declared order.
-        for output_name, prediction in named_outputs.items():
-
-            output_node = navigator.graph.get(output_name)
-            output_type = (
-                output_node.get("type")
-                if output_node is not None
-                else None
-            )
-
-            # Hierarchical output: propagate its prediction recursively.
-            if output_type == "state":
-                local_inputs_map[output_name] = prediction
-                predict_recursively(output_name)
-
-            # Observation or terminal output: collect its prediction.
-            else:
-                predicted_observations.append(
-                    preprocessing.as_flat_tensor(prediction)
-                )
-
-    # Start propagation from the state evaluated by V.
-    predict_recursively(state)
-
-    if not predicted_observations:
-        raise ValueError(
-            f"No predicted observations were produced from state '{state}'."
-        )
-
-    # Concatenate all predicted observations in traversal order.
-    predicted_input = torch.cat(predicted_observations)
-
-    # Associate the prediction with the inputs declared for V.
-    input_names_V = navigator.input_V(state)
-
-    if len(input_names_V) != 1:
-        raise ValueError(
-            f"Expected exactly one input_V for '{state}', "
-            f"but found {len(input_names_V)}: {input_names_V}."
-        )
-
-    local_inputs_map[input_names_V[0]] = predicted_input
-
-    # Execute V.
     return preprocessing.execute_flat_function(
-        navigator,
-        functions_map,
-        local_inputs_map,
-        state,
-        "V",
-        states_list,
-        "V",
-        Q_
+        navigator, functions_map, inputs_map, state, "V", states_list, "V", Q_
     )
-
-
 
 def get_parent_g_predictions(
     navigator, functions_map, inputs_map, state, states_list, Q_

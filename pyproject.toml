@@ -13,6 +13,5 @@ dependencies = [
     "torch",
 ]
 
-[tool.setuptools.packages.find]
-where = ["."]
-include = ["daih*"]
+[tool.setuptools]
+packages = ["daih"]

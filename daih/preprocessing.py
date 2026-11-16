@@ -1,5 +1,5 @@
 from . import model_components, utils
-import torch, math, copy
+import torch, math
 from collections.abc import Mapping
 
 def preprocessing_layer_for_free_energy(state_name, navigator, functions_map, inputs_map, Q_, pi_priors, pi_obs, observations, states_list):
@@ -97,7 +97,7 @@ def preprocessing_for_excepted_free_energy(
         local_inputs_map[outputs_f[0]] = temporal_pred
     else:
         for output_f in outputs_f:
-            local_inputs_map[output_f] = temporal_pred 
+            local_inputs_map[output_f] = temporal_pred
 
     transition_cost = model_components.get_transition_cost(navigator, functions_map, local_inputs_map, parent_of_action, states_list, Q_)
     pi_state = pi_states[parent_of_action]
@@ -552,45 +552,25 @@ def prepare_world_model_inputs(
     """
     Prepares arguments intended for WorldModel.forward().
 
-    For f, g and p, the current state is passed as input.
-    For V, the declared input_V is passed instead.
+    WorldModel conventions are independent
+    of the input names declared in the graph.
 
     Actions can be:
         - An individual action.
         - An action group.
     """
 
-    # Input tensor
-    if function_type == "V":
+    # Current state
+    if state_name not in inputs_map:
+        raise KeyError(
+            f"State '{state_name}' is missing from inputs_map."
+        )
 
-        if len(input_names) != 1:
-            raise ValueError(
-                f"Expected exactly one input_V for '{state_name}', "
-                f"but found {len(input_names)}: {input_names}."
-            )
-
-        input_name = input_names[0]
-
-        if input_name not in inputs_map:
-            raise KeyError(
-                f"V input '{input_name}' for state '{state_name}' "
-                "is missing from inputs_map."
-            )
-
-        state = inputs_map[input_name]
-
-    else:
-
-        if state_name not in inputs_map:
-            raise KeyError(
-                f"State '{state_name}' is missing from inputs_map."
-            )
-
-        state = inputs_map[state_name]
+    state = inputs_map[state_name]
 
     # State identifier
     try:
-        state_id = states_list.index(state_name) + 1
+        state_id = states_list.index(state_name)+1
     except ValueError:
         raise ValueError(
             f"State '{state_name}' is missing from states_list."
@@ -647,85 +627,18 @@ def prepare_world_model_inputs(
         if parameter in input_names and parameter in inputs_map:
             kwargs[parameter] = inputs_map[parameter]
 
-    # Output shapes
+    # g outputs are shaped independently, in the exact order declared by
+    # output_g. Keep output_shape for single-output compatibility.
     if function_type == "g":
         if output_names is None:
-            output_names = get_io_names(
-                navigator, state_name, "g", "output"
-            )
-
-        output_shapes = get_named_output_shapes(
-            navigator, output_names, Q_
-        )
-
+            output_names = get_io_names(navigator, state_name, "g", "output")
+        output_shapes = get_named_output_shapes(navigator, output_names, Q_)
         kwargs["output_shapes"] = output_shapes
-
         if len(output_shapes) == 1:
             kwargs["output_shape"] = output_shapes[0]
-
     elif function_type == "V":
-        kwargs["output_shape"] = (1, 1)
-
+        kwargs["output_shape"] =  (1, 1)
     elif function_type == "p":
         kwargs["temperature"] = inputs_map[f"error_{state_name}"]
 
     return kwargs
-
-
-def handle_missing_observations(observations_actual, pi_obs, pi_obs_substitued, low_precision=1e-7, substitute_value=0.0):
-    """
-    Handles missing observations and restores their original precisions.
-
-    Args:
-        observations_actual (dict): Observations grouped by name.
-        pi_obs (dict): Precision of each individual observation.
-        pi_obs_substitued (dict): Backup of original precisions for
-            currently missing observations.
-        low_precision (float): Precision assigned to missing observations.
-        substitute_value (float): Numerical value replacing None.
-
-    Returns:
-        tuple:
-            - observations_actual
-            - pi_obs
-            - pi_obs_substitued
-    """
-
-    for group, observations in observations_actual.items():
-
-        for observation, value in observations.items():
-
-            # --------------------------------------------------
-            # 1. Missing observation
-            # --------------------------------------------------
-            if value is None:
-
-                # Save the original precision only once.
-                if observation not in pi_obs_substitued:
-
-                    if observation in pi_obs:
-                        pi_obs_substitued[observation] = copy.deepcopy(
-                            pi_obs[observation]
-                        )
-
-                # Reduce its influence during inference.
-                pi_obs[observation] = torch.tensor(
-                    low_precision,
-                    dtype=torch.float32
-                )
-
-                # Replace None with a numerical value.
-                observations[observation] = substitute_value
-
-            # --------------------------------------------------
-            # 2. Observation available again
-            # --------------------------------------------------
-            elif observation in pi_obs_substitued:
-
-                # Restore the original precision if it was saved.
-                pi_obs[observation] = pi_obs_substitued.pop(observation)
-
-    return observations_actual, pi_obs, pi_obs_substitued
-
-
-
