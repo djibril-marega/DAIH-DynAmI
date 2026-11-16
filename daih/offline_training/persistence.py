@@ -13,7 +13,7 @@ import torch
 from torch import nn
 from torch.nn.utils import prune
 
-
+from .. import preprocessing
 FORMAT_VERSION = 1
 
 
@@ -290,7 +290,6 @@ def load_agent(
                 f"Q={sorted(agent.Q_)}, architecture={sorted(agent.generative_functions)}"
             )
         _restore_cached_beliefs(agent)
-        from . import preprocessing
         agent.inputs_map = preprocessing.sync_state_inputs(agent.D, agent.Q_, agent.inputs_map)
 
     precisions = checkpoint.get("precisions", {})
