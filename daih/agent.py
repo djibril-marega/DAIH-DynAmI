@@ -1,8 +1,9 @@
 import torch
 from . import utils, model, preprocessing, inference, model_components
-from .offline_training.offline import OfflineTrainer, OfflineConfig
 import math, copy
-from .offline_training import persistence
+from pathlib import Path
+import os
+import tempfile
 
 # Deep Active Inference Hybride Framework with Dynamic Planning Horizon and Amortized Active Inference (DAIH-DynAmI)
 class Agent_DAIH():
@@ -32,26 +33,38 @@ class Agent_DAIH():
         self.lr_policies = 1
         self.lr_obs = 1
 
-        self.offline = False
-
-        # Original declarative model specification is retained so the
-        # offline structural controller can prepare a safe rebuild.
-        self.generative_functions = None
-        self.observations = None
-        self.actions = None
-        self._offline_trainer = None
-        # User-supplied factory for state/layer-specific local callables.
-        # It is deliberately not serialized; load() receives it explicitly.
-        self._local_function_factory = None
-
-        self.min_pi_p = 1e-9
-        self.F_global = 0
+        # Persistent bounded sample of observations seen during online inference.
+        # Two independent persistent replay memories: surprising observations
+        # (phase I) and surprising transitions (phase II).
+        self.inference_memory_path = "offline_artifacts/observation_memory.pt"
+        self.transition_memory_path = "offline_artifacts/transition_memory.pt"
+        self.inference_memory_capacity = 256
+        self.transition_memory_capacity = 256
+        self.inference_memory_old_fraction = 0.25
+        self.initial_top_k = 1
+        self._pending_transition = None
+        self._last_inference_free_energy = {}
     
     
     def model(self, generative_functions=None, functions_map=None, observations=None, actions=None, pi_p=None):
-        self.generative_functions = copy.deepcopy(generative_functions)
-        self.observations = copy.deepcopy(observations or {})
-        self.actions = copy.deepcopy(actions or {})
+        # Keep the declarative model inputs available to offline architecture
+        # rebuilding and exact checkpoint restoration.
+        if generative_functions is not None:
+            self.generative_functions = generative_functions
+        elif not hasattr(self, "generative_functions"):
+            self.generative_functions = {}
+        if observations is not None:
+            self.observations = observations
+        elif not hasattr(self, "observations"):
+            self.observations = {}
+        if actions is not None:
+            self.actions = actions
+        elif not hasattr(self, "actions"):
+            self.actions = {}
+        generative_functions = self.generative_functions
+        observations = self.observations
+        actions = self.actions
+
         states = model.validate_model(self.D, generative_functions, actions)
         _, idx_to_actions = model.actions_index(actions)
         self.actions_id = idx_to_actions
@@ -84,89 +97,184 @@ class Agent_DAIH():
 
 
 
+    @staticmethod
+    def _atomic_torch_save(payload, path):
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, temp_name = tempfile.mkstemp(prefix=path.name, suffix=".tmp", dir=str(path.parent))
+        os.close(fd)
+        try:
+            torch.save(payload, temp_name)
+            os.replace(temp_name, path)
+        finally:
+            if os.path.exists(temp_name):
+                os.unlink(temp_name)
 
-    def register_local_function_factory(self, factory):
-        """Register the application callback used for local functions.
-
-        Signature:
-            factory(agent, state_name, state_id, layer_id, function_type,
-                    function_name, declaration) -> callable | None
-
-        The returned callable is registered on functions_map[function_name]
-        when that entry is a WorldModel. Return None to use its global model.
-        """
-        if factory is not None and not callable(factory):
-            raise TypeError("factory must be callable or None.")
-        self._local_function_factory = factory
-        return self
-
-    def install_local_functions(self, state_names=None):
-        """Install factory-provided local functions for selected states.
-
-        Returns the installed (state_name, function_type, function_name) keys.
-        """
-        if self._local_function_factory is None:
+    @staticmethod
+    def _load_memory_items(path, key):
+        path = Path(path)
+        if not path.exists():
             return []
-        from .world_model import WorldModel
-        names = list(state_names) if state_names is not None else list(self.generative_functions or {})
-        installed = []
-        function_types = ("f", "g", "p", "V")
-        for state_name in names:
-            declaration = self.generative_functions[state_name]
-            state_id = self.states_list.index(state_name) + 1
-            layer_id = int(declaration.get("layer", 0))
-            for function_type in function_types:
-                function_name = declaration.get(function_type)
-                if not function_name or function_name not in self.functions_map:
-                    continue
-                module = self.functions_map[function_name]
-                if not isinstance(module, WorldModel):
-                    continue
-                local_function = self._local_function_factory(
-                    self, state_name, state_id, layer_id, function_type,
-                    function_name, declaration
-                )
-                if local_function is None:
-                    continue
-                module.register_local_function(
-                    state_id, layer_id, function_type, local_function
-                )
-                installed.append((state_name, function_type, function_name))
-        return installed
+        try:
+            try:
+                payload = torch.load(path, map_location="cpu", weights_only=False)
+            except TypeError:
+                payload = torch.load(path, map_location="cpu")
+            items = payload.get(key, []) if isinstance(payload, dict) else payload
+            return items if isinstance(items, list) else []
+        except Exception:
+            return []
 
-    def save(self, path):
-        """Save architecture, module weights, beliefs and precision tensors."""
-        return persistence.save_agent(self, path)
+    @staticmethod
+    def _load_memory_payload(path):
+        path = Path(path)
+        if not path.exists():
+            return {}
+        try:
+            try:
+                payload = torch.load(path, map_location="cpu", weights_only=False)
+            except TypeError:
+                payload = torch.load(path, map_location="cpu")
+            if isinstance(payload, dict):
+                return payload
+            if isinstance(payload, list):
+                return {"_legacy_items": payload}
+            return {}
+        except Exception:
+            return {}
 
-    @classmethod
-    def load(
-        cls, path, *, functions_map_factory, local_functions_factory=None,
-        map_location="cpu"
-    ):
-        """Load an agent using application-provided function factories.
+    def _retain_memory_item(self, path, key, item, capacity):
+        """Keep a bounded sample while preserving independent memory metadata."""
+        payload = self._load_memory_payload(path)
+        items = payload.get(key, payload.get("_legacy_items", []))
+        items = items if isinstance(items, list) else []
+        payload.pop("_legacy_items", None)
+        capacity = max(1, int(capacity))
+        old_fraction = min(.95, max(0., float(self.inference_memory_old_fraction)))
+        old_quota = min(len(items), int(round(capacity * old_fraction)))
+        recent_quota = max(0, capacity - old_quota - 1)
+        older_pool = items[:-recent_quota] if recent_quota else items
+        if old_quota and older_pool:
+            if old_quota == 1:
+                retained_old = [older_pool[0]]
+            else:
+                indices = [round(i * (len(older_pool)-1)/(old_quota-1)) for i in range(old_quota)]
+                retained_old = [older_pool[i] for i in indices]
+        else:
+            retained_old = []
+        recent = items[-recent_quota:] if recent_quota else []
+        merged = (retained_old + recent + [copy.deepcopy(item)])[-capacity:]
+        payload[key] = merged
+        payload["version"] = max(3, int(payload.get("version", 0) or 0))
+        payload["capacity"] = capacity
+        self._atomic_torch_save(payload, path)
 
-        Only load checkpoints created by a trusted source.
-        """
-        return persistence.load_agent(
-            cls, path, functions_map_factory=functions_map_factory,
-            local_functions_factory=local_functions_factory,
-            map_location=map_location
+    def _accumulate_online_free_energy(self, free_energy):
+        """Persist the mean-reference accumulator independently of bounded retention."""
+        path = Path(self.inference_memory_path)
+        payload = self._load_memory_payload(path)
+        if "_legacy_items" in payload and "observations" not in payload:
+            payload["observations"] = payload.pop("_legacy_items")
+        stats = payload.get("online_free_energy_stats", {})
+        if not isinstance(stats, dict):
+            stats = {}
+        if free_energy is None:
+            return
+        value = float(free_energy)
+        if not math.isfinite(value):
+            return
+        stats["sum"] = float(stats.get("sum", 0.0)) + value
+        stats["count"] = int(stats.get("count", 0)) + 1
+        stats["mean"] = stats["sum"] / max(1, stats["count"])
+        stats["last"] = value
+        payload["online_free_energy_stats"] = stats
+        payload.setdefault("observations", [])
+        payload["version"] = max(3, int(payload.get("version", 0) or 0))
+        payload["capacity"] = int(self.inference_memory_capacity)
+        self._atomic_torch_save(payload, path)
+
+    def _offline_memory_architecture(self, snapshot=None):
+        """Describe the state-level structure present when a memory is recorded."""
+        result = {}
+        source_q = (snapshot or {}).get("Q_", getattr(self, "Q_", {})) or {}
+        state_names = list(source_q) or list(getattr(self, "states_list", []) or [])
+        for state_name in state_names:
+            distributions = source_q.get(state_name, [])
+            dims = []
+            for distribution in distributions or []:
+                mean = getattr(distribution, "mean", None)
+                if mean is None:
+                    mean = getattr(distribution, "loc", None)
+                if mean is None:
+                    dims.append(None)
+                else:
+                    try:
+                        dims.append(tuple(mean.shape))
+                    except Exception:
+                        dims.append(None)
+            result[str(state_name)] = {"under_states": len(distributions or []),
+                                       "distribution_shapes": dims}
+        return result
+
+    def _record_inference_observation(self, observations, surprise=None):
+        if not isinstance(observations, dict):
+            return
+        item = {"observation": copy.deepcopy(observations),
+                "architecture": self._offline_memory_architecture(),
+                "surprise": float(surprise or 0.0)}
+        self._retain_memory_item(self.inference_memory_path, "observations", item,
+                                 self.inference_memory_capacity)
+
+    def _record_transition(self, initial_state, action, next_state, surprise=None):
+        item = {
+            "initial_state": copy.deepcopy(initial_state),
+            "action": copy.deepcopy(action),
+            "next_state": copy.deepcopy(next_state),
+            "architecture": {
+                "initial": self._offline_memory_architecture(initial_state),
+                "next": self._offline_memory_architecture(next_state),
+            },
+            "surprise": float(surprise) if surprise is not None and math.isfinite(float(surprise)) else None,
+        }
+        self._retain_memory_item(
+            self.transition_memory_path, "transitions", item,
+            getattr(self, "transition_memory_capacity", self.inference_memory_capacity),
         )
 
     def inference(self, observations):
-        #print("inside pi obs: ", self.pi_obs)
-        (
-            observations, 
-            self.pi_obs, 
-            self.pi_obs_substitued
-        ) = preprocessing.handle_missing_observations(observations, self.pi_obs, self.pi_obs_substitued)
-
+        (observations, self.pi_obs, self.pi_obs_substitued) = preprocessing.handle_missing_observations(
+            observations, self.pi_obs, self.pi_obs_substitued
+        )
+        # The transition's next state is captured only after the new observation
+        # has updated beliefs. This preserves the order s_t -> a_t -> s_(t+1).
         for motors in self.beliefs_update(observations):
             yield f"action motor: {motors}"
+        current_state = {
+            "Q_": copy.deepcopy(self.Q_),
+            "inputs_map": copy.deepcopy(self.inputs_map),
+            "pi_states": copy.deepcopy(self.pi_states),
+            "pi_priors": copy.deepcopy(self.pi_priors),
+            "pi_obs": copy.deepcopy(self.pi_obs),
+            "pi_obs_substitued": copy.deepcopy(self.pi_obs_substitued),
+            "pi_threshold": copy.deepcopy(self.pi_threshold),
+        }
+        surprise_values = [v for v in self._last_inference_free_energy.values()
+                           if isinstance(v, (int, float)) and math.isfinite(v)]
+        # One online sample is the global F for this inference (sum over states).
+        observation_surprise = sum(surprise_values) if surprise_values else None
+        if self._pending_transition is not None:
+            self._record_transition(
+                self._pending_transition["initial_state"],
+                self._pending_transition.get("action"), current_state,
+                surprise=observation_surprise,
+            )
+        self._accumulate_online_free_energy(observation_surprise)
+        self._record_inference_observation(observations, observation_surprise)
 
         policy_selected = self.policy_selection()
+        action = policy_selected.get("action") if isinstance(policy_selected, dict) else None
+        self._pending_transition = {"initial_state": current_state, "action": action}
         yield f"policy selected: {policy_selected}"
-
 
     # Continuous variational free energy
     def free_energy(self, state_prior, state_posterior, D_poresterior, pi_prior, actual, pi_obs, gamma_obs, prediction):
@@ -180,9 +288,9 @@ class Agent_DAIH():
         return  complexity(state_posterior, state_prior, gamma_obs, pi_prior) - accuracy(actual, pi_obs, prediction)
 
     def beliefs_update(self, observations):
+        self._last_inference_free_energy = {}
         # Retrieve states level by level to start with level 1
         layers_list = self.navigator.layers()
-        self.F_global = 0
         for layer in layers_list:
             states_of_layer = self.navigator.states_by_layer(layer)
             F_layer_list = []
@@ -194,10 +302,7 @@ class Agent_DAIH():
                                                             self.Q_, self.pi_priors, 
                                                             self.pi_obs, observations, self.states_list
                                                             )
-                safe_pi_obs = torch.nan_to_num(
-                    prepared["pi_obs"], nan=1.0, posinf=1e8, neginf=1e-9
-                ).clamp(min=1e-9, max=1e8)
-                gamma_obs = torch.log(safe_pi_obs).requires_grad_(True)
+                gamma_obs = torch.log(prepared["pi_obs"]).requires_grad_(True)
                 
                 # Free energy calcul
                 F = self.free_energy(
@@ -206,32 +311,25 @@ class Agent_DAIH():
                         prepared["f_transition"],
                         prepared["pi_prior"].requires_grad_(True),
                         prepared["actual"],
-                        safe_pi_obs,
+                        prepared["pi_obs"],
                         gamma_obs,
                         prepared["prediction"].requires_grad_(True),
                     )
 
-                # Reject a numerically invalid state update without allowing a
-                # NaN to contaminate Q_, precisions, or subsequent iterations.
-                if not torch.isfinite(F).all():
-                    if self.offline:
-                        yield None, torch.zeros((), dtype=torch.float32), state_name
-                    continue
-
+                # Keep a scalar diagnostic for the phase-I observation memory.
+                try:
+                    self._last_inference_free_energy[state_name] = float(F.detach().cpu().item())
+                except Exception:
+                    self._last_inference_free_energy[state_name] = float("inf")
                 # command motors
                 motors = self.motor_command(state_name, F, prepared["prediction"])
 
                 # mean update
-                offline_dt = getattr(self, "_offline_dt", 0.1) if self.offline else 0.1
-                belief_clip = getattr(self, "_offline_belief_gradient_clip", 100.0)
-                new_posterior = inference.euler_update(
-                    prepared["state_posterior"], offline_dt, F,
-                    max_grad_norm=belief_clip if self.offline else 100.0,
-                )
+                new_posterior = inference.euler_update(prepared["state_posterior"], 0.1, F)
 
                 # Π_obs update
                 self.pi_obs = inference.update_pi_obs(self.navigator, self.pi_obs, gamma_obs, F, self.Q_, state_name, 
-                                                      dt=offline_dt, lr_obs=self.lr_obs
+                                                      dt=0.1, lr_obs=self.lr_obs
                                                     )
                 # re-init original size
                 new_posterior_init_size = new_posterior.reshape(prepared["state_posterior_init_size"].shape)
@@ -253,24 +351,14 @@ class Agent_DAIH():
                 F_layer_list.append(F)
                 pi_priors_list.append(prepared["pi_prior"])
 
-                self.F_global += F.detach()
-                if not self.offline:
-                    if motors:
-                        yield motors
-                else:
-                    if motors:
-                        yield motors, F, state_name
-                    else:
-                        yield None, F, state_name
+                if motors:
+                    yield motors
 
-            # Π_threshold : a layer can be skipped if every state objective
-            # was rejected because of non-finite numerical values.
-            if not F_layer_list:
-                continue
+            # Π_threshold : 
             F_layer = torch.stack(F_layer_list).sum()
             threshold = (1/F_layer) < self.pi_threshold[layer]
 
-            new_pi_threshold = inference.update_threshold(pi_priors_list, F_layer_list, self.pi_threshold[layer], dt=offline_dt if self.offline else 0.1, k=1.0)
+            new_pi_threshold = inference.update_threshold(pi_priors_list, F_layer_list, self.pi_threshold[layer], dt=0.1, k=1.0)
             self.pi_threshold[layer] = new_pi_threshold.detach()
 
             if not threshold:
@@ -349,50 +437,22 @@ class Agent_DAIH():
                 #print("G_posterior: ", G_posterior)
                 try:
                     pi_p = self.pi_p[state_name].requires_grad_(True)
+                    #print("pi_p: ", pi_p)
+                    error_eps = inference.policy_error(G_prior, G_posterior, pi_p)
+                    #print("error_eps: ", error_eps)
 
-                    error_eps = inference.policy_error(
-                        G_prior,
-                        G_posterior,
-                        pi_p
-                    )
-
-                    if pi_p.item() <= self.min_pi_p:
-                        admitted = True
-                    else:
-                        admitted = error_eps.item() <= 1.0
-
-                    if admitted:
-                        first_action = policy_values.policy.policy[0][0]
-                        admited_candidats.append([first_action, G_posterior])
-
-                    else:
-                        self.inputs_map[f"error_{state_name}"] = torch.log(
-                            torch.tensor(1.0 + error_eps.detach().item())
-                        )
-
+                    if error_eps <= 1:
+                        fist_action = policy_values.policy.policy[0][0]
+                        admited_candidats.append([fist_action, G_posterior])
+                    else: 
+                        self.inputs_map[f"error_{state_name}"] = torch.log(torch.tensor(1+1e-7+error_eps.detach().item()))
                 except UnboundLocalError:
                     pass
 
             # Update Π_P
             try:
-                pi_p = self.pi_p[state_name].detach().requires_grad_(True)
-
-                error_eps = inference.policy_error(
-                    G_prior, G_posterior, pi_p
-                )
-
-                next_pi_p = utils.update_wih_grad_desc(
-                    pi_p,
-                    error_eps,
-                    dt=0.1,
-                    k=self.lr_policies
-                )
-
-                self.pi_p[state_name] = torch.clamp(
-                    next_pi_p.detach(),
-                    min=1e-9,
-                    max=1e6
-                )
+                next_pi_p = utils.update_wih_grad_desc(pi_p, error_eps, dt=0.1, k=self.lr_policies)
+                self.pi_p[state_name] = torch.clamp(next_pi_p, min=1e-9, max=1e+6).detach()
             except UnboundLocalError:
                 print("None policies")
                 break
@@ -439,95 +499,43 @@ class Agent_DAIH():
         if not motors_indexes:
             return {}
 
-        # grad descente on complet output_g
-        if not torch.isfinite(F).all() or not torch.isfinite(g_output).all():
-            return {}
-        motor_dt = getattr(self, "_offline_dt", 0.1) if self.offline else 0.1
-        new_y = utils.update_wih_grad_desc(g_output, F, dt=motor_dt, k=self.lr_motors)
-        if not torch.isfinite(new_y).all():
-            return {}
+        # Descente de gradient sur le vecteur complet grad descente on complet output_g
+        new_y = utils.update_wih_grad_desc(g_output, F, dt=0.1, k=self.lr_motors)
 
-        # Keep only the envolved motors 
+        # Keep only the envolved motors
         return {
             name: new_y[index].detach().item()
             for name, index in motors_indexes
         }
 
+
     
+
     def training_offline(
         self,
         observations,
+        config=None,
         *,
         test_observations=None,
-        config=None,
         rebuild_callback=None,
         motor_fn=None,
         motor_train_fn=None,
     ):
-        """
-        Run exactly one global offline-learning iteration.
+        """Run one iteration of the three-macro-phase offline trainer."""
+        from .offline_training.offline import OfflineTrainer
 
-        Parameters
-        ----------
-        observations:
-            Historical observations used for this training iteration.
-        test_observations:
-            Optional held-out observations used to compare global free
-            energy before and after the iteration. Defaults to observations.
-        config:
-            OfflineConfig instance or a dictionary of OfflineConfig values.
-        rebuild_callback:
-            Optional callback that applies the proposed structural plan and
-            returns a new model specification.
-        motor_fn:
-            Optional user-defined callable with signature
-            motor_fn(observation, motors).
-        motor_train_fn:
-            Optional user-owned callback receiving
-            (motor_trace, historical_observations).
-        """
-
-        if self._offline_trainer is None:
-            # First offline training call: create the trainer.
-            self._offline_trainer = OfflineTrainer(
-                self,
-                config=config
-            )
-
+        trainer = getattr(self, "_offline_trainer", None)
+        if trainer is None:
+            trainer = OfflineTrainer(self, config=config)
+            self._offline_trainer = trainer
         elif config is not None:
-            # Normalize the new configuration.
-            new_config = (
-                config
-                if isinstance(config, OfflineConfig)
-                else OfflineConfig(**config)
-            )
+            # Reuse controller state when resuming; update only the supplied
+            # configuration values rather than resetting progress.
+            from .offline_training.offline import OfflineConfig
+            trainer.config = config if isinstance(config, OfflineConfig) else OfflineConfig(**config)
+            trainer._validate_config()
 
-            # Identify the previous and new checkpoint destinations.
-            old_config = self._offline_trainer.config
-
-            old_checkpoint_target = (
-                old_config.checkpoint_dir,
-                old_config.best_checkpoint_filename,
-            )
-
-            new_checkpoint_target = (
-                new_config.checkpoint_dir,
-                new_config.best_checkpoint_filename,
-            )
-
-            # A different checkpoint destination means a new training run.
-            # Reset ONLY the best-model tracking information.
-            if old_checkpoint_target != new_checkpoint_target:
-                self._offline_trainer.best_free_energy = None
-                self._offline_trainer.best_iteration = None
-                self._offline_trainer.best_checkpoint_path = None
-
-            # Preserve the trainer itself, its phase histories,
-            # iteration counter and optimizer states.
-            self._offline_trainer.config = new_config
-
-        # Execute one offline training iteration.
-        return self._offline_trainer.step(
+        return trainer.step(
             observations,
             test_observations=test_observations,
             rebuild_callback=rebuild_callback,
@@ -535,3 +543,6 @@ class Agent_DAIH():
             motor_train_fn=motor_train_fn,
         )
 
+    def offline(self, observations, config=None, **kwargs):
+        """Backward-compatible short alias for training_offline()."""
+        return self.training_offline(observations, config=config, **kwargs)

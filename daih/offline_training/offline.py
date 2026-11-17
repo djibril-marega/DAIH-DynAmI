@@ -1,4 +1,4 @@
-"""Adaptive offline optimization for Agent_DAIH (v7).
+"""Adaptive offline optimization for Agent_DAIH (v12).
 
 The shared WorldModel is optimized against the sum of all state free energies.
 Policy generators are optimized separately with expected-free-energy policy
@@ -20,6 +20,8 @@ from contextlib import contextmanager
 import json
 import math
 import time
+import os
+import tempfile
 
 import torch
 from torch import nn
@@ -86,7 +88,7 @@ class OfflineConfig:
     policy_alignment_weight: float = 1.0
     policy_baseline_momentum: float = 0.9
 
-    neuron_step: int = 16
+    neuron_step: int = 1
     world_model_min_neurons: int = 64
     world_model_max_neurons: int = 512
     max_total_states: int | None = 64  # Legacy global safety cap; graph_constraints.max_states is preferred.
@@ -94,10 +96,35 @@ class OfflineConfig:
     state_constraints: dict[str, dict[str, Any]] = field(default_factory=dict)
     checkpoint_dir: str | None = "offline_artifacts"
     checkpoint_every: int = 50  # Full "after" checkpoint cadence, in offline steps.
+    save_phase_checkpoints: bool = True  # Mandatory end-of-phase full-agent snapshots by default.
+    phase_checkpoint_prefix: str = "offline_phase"
     plan_filename: str = "offline_plan.json"
     checkpoint_filename: str = "offline_before.pt"
     final_checkpoint_filename: str = "offline_after.pt"
     best_checkpoint_filename: str = "offline_best_agent.pt"
+
+    # DAIH offline paradigm v8: three macro-phases.
+    global_precision: float = 1e-3
+    macro_patience: int = 5
+    macro_relative_tolerance: float = 1e-3
+    divergence_tolerance: float = 0.05
+    initial_top_k: int = 1
+    top_k_step: int = 1
+    temporal_horizon: int = 8  # Legacy compatibility only; Dreamer H comes from policy sequence length.
+    temporal_loss_weight: float = 1.0
+    policy_precision_min: float = 1e-9
+    structural_evaluation_limit: int = 1
+    enable_structural_phase: bool = True
+
+    # Persistent observations collected during online inference.
+    inference_memory_path: str = "offline_artifacts/observation_memory.pt"
+    transition_memory_path: str = "offline_artifacts/transition_memory.pt"
+    inference_memory_capacity: int = 256
+    transition_memory_capacity: int = 256
+    inference_memory_old_fraction: float = 0.25
+    include_inference_memory: bool = True
+    include_transition_memory: bool = True
+    temporal_precision: float | None = None
 
 
 @dataclass
@@ -111,7 +138,7 @@ class StateProgress:
     phase_best_free_energy: float | None = None
 
 
-class OfflineTrainer:
+class _LegacyOfflineTrainer:
     """Stateful offline trainer; progress survives successive method calls."""
 
     PHASE_NAMES = {
@@ -454,7 +481,10 @@ class OfflineTrainer:
             for index, observation in enumerate(observations):
                 if self.config.observation_mode == "independent":
                     self._restore_beliefs(initial)
+                allowed_states = self._observation_compatibility.get(id(observation))
                 prepared = deepcopy(observation)
+                if allowed_states is not None:
+                    self._observation_compatibility[id(prepared)] = set(allowed_states)
                 prepared, pi_obs, pi_substituted = preprocessing.handle_missing_observations(
                     prepared, deepcopy(self.agent.pi_obs), deepcopy(self.agent.pi_obs_substitued)
                 )
@@ -674,6 +704,10 @@ class OfflineTrainer:
             return []
         return [{"params": parameters, "lr": self.config.learning_rate}]
 
+    def _allowed_states_for_frame(self, frame):
+        """None means all current states; a set is a per-observation compatibility mask."""
+        return self._observation_compatibility.get(id(frame))
+
     def _optimize_world_model(self, observations: dict):
         groups = self._parameter_groups()
         if not groups:
@@ -708,8 +742,11 @@ class OfflineTrainer:
         ]
         batches = observations if (isinstance(observations, list) and observations and isinstance(observations[0], tuple)) else [(observations, self._snapshot_beliefs())]
         for frame, belief_context in batches:
+            allowed_states = self._allowed_states_for_frame(frame)
             with self._using_beliefs(belief_context):
                 for state_name in state_names:
+                    if allowed_states is not None and state_name not in allowed_states:
+                        continue
                     _, _, F_value = self._state_objective(state_name, frame)
                     if F_value.requires_grad and torch.isfinite(F_value):
                         losses.append(F_value / max(1, len(batches)))
@@ -785,15 +822,17 @@ class OfflineTrainer:
                     prepared["transition_cost"],
                 )
                 posterior_values.append(g_posterior)
+                predicted = prepared["temporal_pred"]
+                if isinstance(predicted, (tuple, list)) and predicted:
+                    predicted = predicted[0]
                 new_precision = inference.seconde_derivative_from_output(
-                    prepared["temporal_pred"], local_inputs[parent_state]
+                    predicted, local_inputs[parent_state]
                 )
                 local_q[parent_state] = inference.update_distributions(
-                    new_precision.detach(),
-                    prepared["temporal_pred"].detach(),
-                    local_q[parent_state],
-                    eps=1e-6,
+                    new_precision.detach(), predicted.detach(), local_q[parent_state], eps=1e-6
                 )
+                # The next policy step conditions on the preceding imagined state.
+                local_inputs[parent_state] = predicted
         if not posterior_values:
             return None
         return torch.stack([value.reshape(()) for value in posterior_values]).mean()
@@ -881,7 +920,7 @@ class OfflineTrainer:
                 baseline = self._policy_baselines.get(state_name, 0.0)
                 advantage = g_posterior - float(baseline)
                 efe_loss = advantage * (-sequence_log_probability)
-                alignment_loss = (g_prior - g_posterior).square()
+                alignment_loss = (g_prior - g_posterior).square() * self._policy_precision(state_name)
                 total = (
                     float(self.config.policy_efe_weight) * efe_loss
                     + float(self.config.policy_alignment_weight) * alignment_loss
@@ -923,9 +962,12 @@ class OfflineTrainer:
         batches = observations if (isinstance(observations, list) and observations and isinstance(observations[0], tuple)) else [(observations, self._snapshot_beliefs())]
         collected: dict[str, list[StateMetrics]] = defaultdict(list)
         for frame, belief_context in batches:
+            allowed_states = self._allowed_states_for_frame(frame)
             with self._using_beliefs(belief_context):
                 for state_name, node in self.agent.navigator.graph.items():
                     if node.get("type") != "state":
+                        continue
+                    if allowed_states is not None and state_name not in allowed_states:
                         continue
                     metric, _ = self._measure_state(state_name, frame)
                     collected[state_name].append(metric)
@@ -1453,6 +1495,16 @@ class OfflineTrainer:
         path = directory / self.config.final_checkpoint_filename
         return str(save_agent(self.agent, path))
 
+    def _checkpoint_phase_end(self, phase: int, phase_name: str):
+        """Persist a complete agent at each executed macro-phase boundary."""
+        if not bool(getattr(self.config, "save_phase_checkpoints", True)):
+            return None
+        from .persistence import save_agent
+        directory = Path(self.config.checkpoint_dir or "offline_artifacts")
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / f"{self.config.phase_checkpoint_prefix}_{int(phase)}_{phase_name}_iter_{self.iteration:08d}.pt"
+        return str(save_agent(self.agent, path))
+
     def _write_plan(self, plan: dict[str, Any]):
         if not self.config.checkpoint_dir:
             return None
@@ -1530,6 +1582,11 @@ class OfflineTrainer:
         motor_train_fn: Callable | None = None,
     ) -> dict[str, Any]:
         self._validate_config()
+        if rebuild_callback is not None:
+            raise ValueError(
+                "Paradigm v8 applies structural operations through OfflineArchitecture; "
+                "rebuild_callback is not used."
+            )
         if self.agent.navigator is None:
             raise RuntimeError("Call Agent_DAIH.model() before training_offline().")
         training_frames = self._normalize_observations(observations)
@@ -1794,3 +1851,1184 @@ class OfflineTrainer:
                 "observations": self.agent.lr_obs,
             },
         }
+
+
+# =============================================================================
+# Offline paradigm v8: hierarchical prediction / temporal prediction / BMR
+# =============================================================================
+class OfflineTrainer(_LegacyOfflineTrainer):
+    """
+    Three-macro-phase offline trainer.
+
+    Macro-phases I and II alternate on every step until both objectives have
+    converged or clearly diverged. Macro-phase III evaluates one structural
+    deletion per step; accepted deletion restarts learning at macro-phase I.
+    If all tested structures are retained, one capacity addition from a
+    retained structural family is evaluated.
+    """
+
+    MACRO_NAMES = {
+        1: "hierarchical_predictions",
+        2: "temporal_predictions",
+        3: "architectural_restructuring",
+    }
+
+    def __init__(self, agent, config: OfflineConfig | dict | None = None):
+        super().__init__(agent, config)
+        self.agent._offline_trainer = self
+        # The online collector and offline reader must share one file and one cap.
+        self.agent.inference_memory_path = self.config.inference_memory_path
+        self.agent.transition_memory_path = self.config.transition_memory_path
+        self.agent.inference_memory_capacity = int(self.config.inference_memory_capacity)
+        self.agent.transition_memory_capacity = int(self.config.transition_memory_capacity)
+        self.agent.inference_memory_old_fraction = float(self.config.inference_memory_old_fraction)
+        self.macro_phase = 1
+        self.top_k = max(1, int(self.config.initial_top_k))
+        self._hierarchical_history = deque(maxlen=max(3, self.config.macro_patience))
+        self._temporal_history = deque(maxlen=max(3, self.config.macro_patience))
+        self._hierarchical_done = False
+        self._temporal_done = False
+        self._structural_candidates = []
+        self._structural_cursor = 0
+        self._retained_candidates = []
+        self._structural_log = []
+        self._creation_cursor = 0
+        self._macro_cycles = 0
+        self._last_temporal_loss = None
+        self._last_replay_info = {"loaded": 0, "new": 0, "total": 0}
+        self._last_observation_state_scores = {}
+        self._temporal_surprise_trace = []
+        self._observation_compatibility = {}
+
+    def _validate_config(self):
+        super()._validate_config()
+        if self.config.global_precision <= 0:
+            raise ValueError("global_precision must be strictly positive.")
+        if self.config.macro_patience < 3:
+            raise ValueError("macro_patience must be >= 3.")
+        if self.config.macro_relative_tolerance < 0 or self.config.divergence_tolerance <= 0:
+            raise ValueError("Macro-phase tolerances must be non-negative and divergence_tolerance positive.")
+        if self.config.initial_top_k < 1 or self.config.top_k_step < 1:
+            raise ValueError("initial_top_k and top_k_step must be >= 1.")
+        if self.config.temporal_loss_weight < 0:
+            raise ValueError("temporal_loss_weight must be non-negative.")
+        if int(self.config.inference_memory_capacity) < 1:
+            raise ValueError("inference_memory_capacity must be >= 1.")
+        if int(self.config.transition_memory_capacity) < 1:
+            raise ValueError("transition_memory_capacity must be >= 1.")
+        if not 0.0 <= float(self.config.inference_memory_old_fraction) < 1.0:
+            raise ValueError("inference_memory_old_fraction must be in [0, 1).")
+        if self.config.temporal_precision is not None and float(self.config.temporal_precision) <= 0:
+            raise ValueError("temporal_precision must be strictly positive when provided.")
+
+    def state_dict(self) -> dict:
+        state = super().state_dict()
+        state["paradigm"] = "daih_offline_v12"
+        state["macro_controller"] = {
+            "macro_phase": self.macro_phase,
+            "top_k": self.top_k,
+            "hierarchical_history": list(self._hierarchical_history),
+            "temporal_history": list(self._temporal_history),
+            "hierarchical_done": self._hierarchical_done,
+            "temporal_done": self._temporal_done,
+            "structural_candidates": deepcopy(self._structural_candidates),
+            "structural_cursor": self._structural_cursor,
+            "retained_candidates": deepcopy(self._retained_candidates),
+            "structural_log": deepcopy(self._structural_log),
+            "creation_cursor": self._creation_cursor,
+            "macro_cycles": self._macro_cycles,
+            "last_temporal_loss": self._last_temporal_loss,
+            "last_replay_info": deepcopy(self._last_replay_info),
+        }
+        return state
+
+    def load_state_dict(self, state: dict) -> None:
+        super().load_state_dict(state)
+        macro = state.get("macro_controller", {})
+        self.macro_phase = int(macro.get("macro_phase", 1))
+        self.top_k = max(1, int(macro.get("top_k", self.config.initial_top_k)))
+        self._hierarchical_history = deque(
+            macro.get("hierarchical_history", []),
+            maxlen=max(3, self.config.macro_patience),
+        )
+        self._temporal_history = deque(
+            macro.get("temporal_history", []),
+            maxlen=max(3, self.config.macro_patience),
+        )
+        self._hierarchical_done = bool(macro.get("hierarchical_done", False))
+        self._temporal_done = bool(macro.get("temporal_done", False))
+        self._structural_candidates = deepcopy(macro.get("structural_candidates", []))
+        self._structural_cursor = int(macro.get("structural_cursor", 0))
+        self._retained_candidates = deepcopy(macro.get("retained_candidates", []))
+        self._structural_log = deepcopy(macro.get("structural_log", []))
+        self._creation_cursor = int(macro.get("creation_cursor", 0))
+        self._macro_cycles = int(macro.get("macro_cycles", 0))
+        self._last_temporal_loss = macro.get("last_temporal_loss")
+        self._last_replay_info = deepcopy(macro.get("last_replay_info", {"loaded": 0, "new": 0, "total": 0}))
+
+    @staticmethod
+    def _scalar(value, default=0.0) -> float:
+        try:
+            if torch.is_tensor(value):
+                value = value.detach().float().mean().cpu().item()
+            result = float(value)
+            return result if math.isfinite(result) else float(default)
+        except (TypeError, ValueError, RuntimeError):
+            return float(default)
+
+    def _global_precision(self) -> float:
+        return max(float(self.config.global_precision), float(self.config.min_precision))
+
+    def _state_precision(self, state_name: str) -> float:
+        values = getattr(self.agent, "pi_states", {}) or {}
+        return max(self._scalar(values.get(state_name), self._global_precision()),
+                   float(self.config.min_precision))
+
+    def _policy_precision(self, state_name: str) -> float:
+        values = getattr(self.agent, "pi_p", {}) or {}
+        return max(self._scalar(values.get(state_name), 1.0),
+                   float(self.config.policy_precision_min))
+
+    @staticmethod
+    def _distribution_mean(distribution):
+        if hasattr(distribution, "loc"):
+            return distribution.loc
+        if hasattr(distribution, "mean"):
+            return distribution.mean
+        return torch.as_tensor(distribution)
+
+    def _observation_scores(self, contexts):
+        scores = []
+        self._last_observation_state_scores = {}
+        for index, (frame, belief_context) in enumerate(contexts):
+            with self._using_beliefs(belief_context):
+                value, metrics = self._evaluate([(frame, belief_context)])
+            scores.append((index, float(value)))
+            self._last_observation_state_scores[index] = {
+                name: self._scalar(metric.free_energy)
+                for name, metric in metrics.items()
+            }
+        return scores
+
+    @staticmethod
+    def _causal_reference_name(reference):
+        """Return a hashable state/node name from a graph parent reference.
+
+        Navigator implementations may expose parents either as plain state
+        names or as structured dictionaries (for example
+        {"name": "state_a"} / {"state_name": "state_a"}).  Never use the
+        dictionary itself as a graph key or set member.
+        """
+        if isinstance(reference, str):
+            return reference
+        if isinstance(reference, (int, float)):
+            return str(reference)
+        if isinstance(reference, dict):
+            for key in ("state_name", "name", "node_name", "state", "node", "id", "key"):
+                if key in reference:
+                    value = OfflineTrainer._causal_reference_name(reference[key])
+                    if value is not None:
+                        return value
+            return None
+        if isinstance(reference, (tuple, list)):
+            for item in reference:
+                value = OfflineTrainer._causal_reference_name(item)
+                if value is not None:
+                    return value
+            return None
+        for attribute in ("state_name", "name", "node_name", "id"):
+            value = getattr(reference, attribute, None)
+            if value is not None and value is not reference:
+                normalized = OfflineTrainer._causal_reference_name(value)
+                if normalized is not None:
+                    return normalized
+        return None
+
+    def _causal_ancestors(self, state_names):
+        """Expand surprising states to graph ancestors, accepting structured parents."""
+        navigator = getattr(self.agent, "navigator", None)
+        graph = getattr(navigator, "graph", {}) or {}
+        if not isinstance(graph, dict):
+            return sorted({name for item in state_names
+                           if (name := self._causal_reference_name(item)) is not None})
+
+        visited = {
+            name for item in state_names
+            if (name := self._causal_reference_name(item)) is not None
+        }
+        queue = list(visited)
+        while queue:
+            name = queue.pop(0)
+            node = graph.get(name, {})
+            if not isinstance(node, dict):
+                continue
+            parents = node.get("parents", []) or []
+            # A single parent can itself be a mapping, rather than a list.
+            if isinstance(parents, dict):
+                parents = [parents]
+            elif isinstance(parents, (str, int, float)):
+                parents = [parents]
+            for parent_ref in parents:
+                parent = self._causal_reference_name(parent_ref)
+                if parent is not None and parent in graph and parent not in visited:
+                    visited.add(parent)
+                    queue.append(parent)
+        return sorted(visited)
+
+    def _select_surprising_contexts(self, contexts):
+        scores = self._observation_scores(contexts)
+        ranked = sorted(scores, key=lambda item: item[1], reverse=True)
+        count = min(max(1, int(self.top_k)), int(self.config.inference_memory_capacity), len(ranked))
+        selected_ids = {index for index, _ in ranked[:count]}
+        selected = [item for index, item in enumerate(contexts) if index in selected_ids]
+        state_surprises = []
+        for index in selected_ids:
+            for state_name, state_f in self._last_observation_state_scores.get(index, {}).items():
+                state_surprises.append((state_name, state_f, index))
+        state_surprises.sort(key=lambda item: item[1], reverse=True)
+        surprising_states = []
+        for state_name, _, _ in state_surprises:
+            if state_name not in surprising_states:
+                surprising_states.append(state_name)
+        causal_factors = self._causal_ancestors(surprising_states)
+        return selected, {
+            "top_k_requested": int(self.top_k),
+            "top_k_effective": count,
+            "top_k_capacity": int(self.config.inference_memory_capacity),
+            "observations_total": len(contexts),
+            "observations_selected": count,
+            "ranked_indices": [index for index, _ in ranked],
+            "surprising_states": surprising_states,
+            "causal_explanatory_factors": causal_factors,
+            "state_surprise_ranking": [
+                {"state": name, "free_energy": value, "observation_index": index}
+                for name, value, index in state_surprises
+            ],
+        }
+
+    def _objective_status(self, history, precision=None):
+        """Absolute convergence test for one minimized objective."""
+        if len(history) < self.config.macro_patience:
+            return "active"
+        values = list(history)
+        tolerance = float(precision if precision is not None else self._global_precision())
+        variation = abs(values[-1] - values[0])
+        return "converged" if variation <= tolerance else "active"
+
+    def _joint_macro_status(self):
+        """Stop phases I/II only on joint convergence or opposing progress.
+
+        Both objectives are minimized. A clear disagreement in their trends
+        (one improves while the other worsens beyond its precision) is treated
+        as divergence of the coupled learning cycle.
+        """
+        required = int(self.config.macro_patience)
+        if len(self._hierarchical_history) < required or len(self._temporal_history) < required:
+            return "active", {"reason": "insufficient_history"}
+        h = list(self._hierarchical_history)
+        t = list(self._temporal_history)
+        dh = h[-1] - h[0]
+        dt = t[-1] - t[0]
+        hp = self._global_precision()
+        tp = float(self.config.temporal_precision or self._global_precision())
+        h_stable = abs(dh) <= hp
+        t_stable = abs(dt) <= tp
+        if h_stable and t_stable:
+            return "converged", {"delta_hierarchical": dh, "delta_temporal": dt,
+                                 "precision_hierarchical": hp, "precision_temporal": tp}
+        opposing = (dh < -hp and dt > tp) or (dh > hp and dt < -tp)
+        if opposing:
+            return "diverged", {"delta_hierarchical": dh, "delta_temporal": dt,
+                                "precision_hierarchical": hp, "precision_temporal": tp}
+        return "active", {"delta_hierarchical": dh, "delta_temporal": dt,
+                           "precision_hierarchical": hp, "precision_temporal": tp}
+
+    def _load_inference_memory(self):
+        """Return observation records with their recording-time architecture metadata."""
+        if not self.config.include_inference_memory:
+            return []
+        path = Path(self.config.inference_memory_path)
+        if not path.exists():
+            return []
+        try:
+            try:
+                payload = torch.load(path, map_location="cpu", weights_only=False)
+            except TypeError:
+                payload = torch.load(path, map_location="cpu")
+        except Exception:
+            return []
+        if isinstance(payload, dict):
+            items = payload.get("observations", payload.get("frames", []))
+        elif isinstance(payload, list):
+            items = payload
+        else:
+            items = []
+        records = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            if isinstance(item.get("observation"), dict):
+                records.append({
+                    "observation": deepcopy(item["observation"]),
+                    "architecture": deepcopy(item.get("architecture", {})),
+                    "surprise": item.get("surprise"),
+                })
+            else:
+                # Legacy raw-observation records have no architecture metadata.
+                records.append({"observation": deepcopy(item), "architecture": None,
+                                "surprise": None})
+        return records
+
+    def _compatible_observation_states(self, stored_architecture):
+        """Keep only states whose recorded dimensions still match the live model."""
+        if not isinstance(stored_architecture, dict) or not stored_architecture:
+            # Legacy memories lack enough metadata to prove a mismatch.
+            return None
+        current = self.agent._offline_memory_architecture()
+        compatible = set()
+        for state_name, old in stored_architecture.items():
+            now = current.get(state_name)
+            if not isinstance(old, dict) or not isinstance(now, dict):
+                continue
+            try:
+                old_count = int(old.get("under_states", -1))
+                current_count = int(now.get("under_states", -2))
+            except (TypeError, ValueError):
+                continue
+            if old_count != current_count:
+                continue
+            old_shapes = old.get("distribution_shapes")
+            new_shapes = now.get("distribution_shapes")
+            if old_shapes == new_shapes:
+                compatible.add(state_name)
+        return compatible
+
+    def _load_transition_memory(self):
+        if not self.config.include_transition_memory:
+            return []
+        path = Path(self.config.transition_memory_path)
+        if not path.exists():
+            return []
+        try:
+            try:
+                payload = torch.load(path, map_location="cpu", weights_only=False)
+            except TypeError:
+                payload = torch.load(path, map_location="cpu")
+        except Exception:
+            return []
+        if isinstance(payload, dict):
+            items = payload.get("transitions", [])
+        elif isinstance(payload, list):
+            items = payload
+        else:
+            items = []
+        return [deepcopy(item) for item in items if isinstance(item, dict)
+                and isinstance(item.get("initial_state"), dict)
+                and isinstance(item.get("next_state"), dict)]
+
+    def _merge_inference_memory(self, new_frames):
+        """Phase I reader: observation memory only, with component-wise compatibility masks."""
+        records = self._load_inference_memory()
+        old_frames = []
+        self._observation_compatibility = {}
+        for record in records:
+            frame = deepcopy(record.get("observation", {}))
+            if not isinstance(frame, dict):
+                continue
+            allowed = self._compatible_observation_states(record.get("architecture"))
+            if allowed is not None:
+                if not allowed:
+                    continue
+                self._observation_compatibility[id(frame)] = allowed
+            old_frames.append(frame)
+        merged = old_frames + new_frames
+        self._last_replay_info = {
+            "observation_memory_loaded": len(old_frames),
+            "new_observations": len(new_frames),
+            "observation_replay_total": len(merged),
+            "top_k_capacity": int(self.config.inference_memory_capacity),
+            "compatibility_masked_records": sum(
+                1 for frame in old_frames if self._observation_compatibility.get(id(frame)) is not None
+            ),
+        }
+        return merged
+
+    def _read_online_free_energy_reference(self):
+        """Read persistent sum/count; this statistic is not bounded by sample retention."""
+        path = Path(self.config.inference_memory_path)
+        if not path.exists():
+            return {"sum": 0.0, "count": 0, "mean": None}
+        try:
+            try:
+                payload = torch.load(path, map_location="cpu", weights_only=False)
+            except TypeError:
+                payload = torch.load(path, map_location="cpu")
+            stats = payload.get("online_free_energy_stats", {}) if isinstance(payload, dict) else {}
+            total = float(stats.get("sum", 0.0))
+            count = int(stats.get("count", 0))
+            return {"sum": total, "count": count, "mean": total / count if count > 0 else None}
+        except Exception:
+            return {"sum": 0.0, "count": 0, "mean": None}
+
+    def _reset_online_free_energy_reference(self):
+        """Consume the online interval only after a successful offline step."""
+        path = Path(self.config.inference_memory_path)
+        if not path.exists():
+            return
+        try:
+            try:
+                payload = torch.load(path, map_location="cpu", weights_only=False)
+            except TypeError:
+                payload = torch.load(path, map_location="cpu")
+            if not isinstance(payload, dict):
+                payload = {"observations": payload if isinstance(payload, list) else []}
+            payload["online_free_energy_stats"] = {"sum": 0.0, "count": 0, "mean": None}
+            fd, temp_name = tempfile.mkstemp(prefix=path.name, suffix=".tmp", dir=str(path.parent))
+            os.close(fd)
+            try:
+                torch.save(payload, temp_name)
+                os.replace(temp_name, path)
+            finally:
+                if os.path.exists(temp_name):
+                    os.unlink(temp_name)
+        except Exception as exc:
+            raise RuntimeError(f"Unable to reset online free-energy reference: {exc}") from exc
+
+    @staticmethod
+    def _distribution_shape(distribution):
+        mean = getattr(distribution, "mean", None)
+        if mean is None:
+            mean = getattr(distribution, "loc", None)
+        if mean is None:
+            return None
+        try:
+            return tuple(mean.shape)
+        except Exception:
+            return None
+
+    def _state_snapshot_compatible(self, stored_snapshot, state_name):
+        """Check one state's posterior structure without rejecting its siblings."""
+        stored_q = stored_snapshot.get("Q_", {}) if isinstance(stored_snapshot, dict) else {}
+        current_q = getattr(self.agent, "Q_", {}) or {}
+        if state_name not in stored_q or state_name not in current_q:
+            return False
+        old_distributions = stored_q.get(state_name) or []
+        new_distributions = current_q.get(state_name) or []
+        if len(old_distributions) != len(new_distributions):
+            return False
+        old_shapes = [self._distribution_shape(value) for value in old_distributions]
+        new_shapes = [self._distribution_shape(value) for value in new_distributions]
+        return old_shapes == new_shapes
+
+    def _partial_transition_beliefs(self, stored_snapshot):
+        """Overlay only compatible stored states onto current beliefs.
+
+        The current architecture remains the default. Deleted states and states
+        whose under-state count or posterior tensor shapes changed are omitted.
+        """
+        current = self._snapshot_beliefs()
+        compatible = []
+        stored_q = stored_snapshot.get("Q_", {}) if isinstance(stored_snapshot, dict) else {}
+        current_q = current.get("Q_", {}) or {}
+        for state_name in list(current_q):
+            if not self._state_snapshot_compatible(stored_snapshot, state_name):
+                continue
+            compatible.append(state_name)
+            for field in ("Q_", "inputs_map", "pi_states", "pi_priors",
+                          "pi_threshold"):
+                old_map = stored_snapshot.get(field)
+                new_map = current.get(field)
+                if isinstance(old_map, dict) and isinstance(new_map, dict):
+                    if state_name in old_map and state_name in new_map:
+                        new_map[state_name] = deepcopy(old_map[state_name])
+        # Keep only the states that can be replayed; callers iterate this list.
+        return current, compatible
+
+    def _snapshots_are_consecutive(self, previous_next, following_initial, atol=1e-6, rtol=1e-5):
+        """Return true when two stored snapshots describe the same awake instant."""
+        left = previous_next.get("Q_", {}) if isinstance(previous_next, dict) else {}
+        right = following_initial.get("Q_", {}) if isinstance(following_initial, dict) else {}
+        common = [name for name in left if name in right]
+        if not common:
+            return False
+        compared = 0
+        for name in common:
+            if len(left[name] or []) != len(right[name] or []):
+                return False
+            for a, b in zip(left[name] or [], right[name] or []):
+                av = self._distribution_mean(a).detach()
+                bv = self._distribution_mean(b).detach()
+                # A changed/deleted component does not invalidate compatible
+                # sibling states in the same historical snapshot.
+                if av.shape != bv.shape or not torch.allclose(av, bv, atol=atol, rtol=rtol):
+                    continue
+                compared += 1
+        return compared > 0
+
+    def _transition_chains(self, transitions, horizon):
+        """Build only genuinely contiguous awake chains of exactly H transitions."""
+        horizon = max(1, int(horizon))
+        chains = []
+        if len(transitions) < horizon:
+            return chains
+        for start in range(0, len(transitions) - horizon + 1):
+            candidate = transitions[start:start + horizon]
+            contiguous = all(
+                self._snapshots_are_consecutive(candidate[offset]["next_state"],
+                                                candidate[offset + 1]["initial_state"])
+                for offset in range(horizon - 1)
+            )
+            if contiguous:
+                chains.append((start, candidate))
+        return chains
+
+    def _awake_belief_for_transition(self, transition):
+        """s_t^y: actual posterior belief captured after the awake inference at t."""
+        belief = transition.get("awake_belief")
+        if isinstance(belief, dict) and belief:
+            return belief
+        return transition.get("next_state", {}).get("Q_", {})
+
+    def _dream_trajectory_loss(self, transition, chain, policy_output, policy_state):
+        """Roll out H imagined steps and regress them onto H recorded awake beliefs.
+
+        The recorded transition action may be None: it is not used to discard or
+        truncate the awake target. Dream actions are generated by the current policy.
+        """
+        policy_tensor = policy_output.policy
+        sequence = policy_tensor[0] if policy_tensor.ndim >= 3 else policy_tensor
+        horizon = int(sequence.shape[0])
+        if horizon < 1 or len(chain) != horizon:
+            return [], 0
+        initial = transition["initial_state"]
+        initial_context, compatible_initial = self._partial_transition_beliefs(initial)
+        if not compatible_initial:
+            return [], 0
+        losses = []
+        completed_steps = 0
+        with self._using_beliefs(initial_context):
+            local_q = deepcopy(self.agent.Q_)
+            local_inputs = {
+                key: (value.detach().clone() if torch.is_tensor(value) else deepcopy(value))
+                for key, value in self.agent.inputs_map.items()
+            }
+            for t, action_t in enumerate(sequence):
+                if not torch.isfinite(action_t).all():
+                    return [], 0
+                if abs(float(action_t.detach().sum().item()) - 1.0) > 1e-4:
+                    return [], 0
+                parent_states, action_name = preprocessing.get_one_hot_action_parents(
+                    action_t, self.agent.actions_id, self.agent.navigator
+                )
+                awake_q = self._awake_belief_for_transition(chain[t])
+                step_losses = []
+                for parent_state in parent_states:
+                    if parent_state not in local_inputs or parent_state not in local_q:
+                        continue
+                    actions_for_state = self.agent.navigator.child_nodes(
+                        parent_state, node_type="action"
+                    )
+                    if action_name not in actions_for_state:
+                        continue
+                    source = local_inputs[parent_state]
+                    if torch.is_tensor(source) and not source.requires_grad:
+                        source = source.detach().clone().requires_grad_(True)
+                        local_inputs[parent_state] = source
+                    prepared = preprocessing.preprocessing_for_excepted_free_energy(
+                        actions_for_state, action_name, parent_state, local_inputs,
+                        self.agent.pi_states, self.agent.navigator,
+                        self.agent.functions_map, local_q, self.agent.states_list,
+                    )
+                    predicted = prepared.get("temporal_pred")
+                    # Generative APIs may return (prediction, mask); the mask
+                    # is metadata and is not part of the predicted state.
+                    if isinstance(predicted, (tuple, list)) and predicted:
+                        predicted = predicted[0]
+                    target_distributions = awake_q.get(parent_state)
+                    if predicted is None or not target_distributions:
+                        continue
+                    target = torch.stack([
+                        self._distribution_mean(dist).detach()
+                        for dist in target_distributions
+                    ])
+                    predicted = predicted if torch.is_tensor(predicted) else torch.as_tensor(predicted)
+                    target = target.to(device=predicted.device, dtype=predicted.dtype)
+                    if predicted.shape != target.shape:
+                        if predicted.numel() != target.numel():
+                            continue
+                        predicted = predicted.reshape_as(target)
+                    # Exact specified WorldModel objective: sum_t ||s_x(t)-s_y(t)||^2.
+                    step_loss = (predicted - target).square().sum()
+                    if torch.isfinite(step_loss):
+                        losses.append(step_loss)
+                        step_losses.append(self._scalar(step_loss.detach()))
+                        self._temporal_surprise_trace.append({
+                            "memory": "awake_sleep_trajectory",
+                            "policy_state": str(policy_state),
+                            "transition_state": str(parent_state),
+                            "horizon_step": int(t + 1),
+                            "recorded_action": chain[t].get("action"),
+                            "recorded_action_missing": chain[t].get("action") is None,
+                            "awake_belief_target": "next_state.Q_",
+                            "surprise": self._scalar(step_loss.detach()),
+                        })
+                    # The imagined belief is propagated, never replaced by the awake target.
+                    new_precision = inference.seconde_derivative_from_output(predicted, source)
+                    local_q[parent_state] = inference.update_distributions(
+                        new_precision.detach(), predicted.detach(), local_q[parent_state], eps=1e-6
+                    )
+                    local_inputs[parent_state] = predicted
+                if not step_losses:
+                    # A missing compatible state at a time step invalidates this rollout;
+                    # do not silently shorten H or change the stated objective.
+                    return [], 0
+                completed_steps += 1
+        return losses, completed_steps
+
+    def _temporal_loss(self):
+        """Phase II reads transition memory only and trains on full awake/dream chains."""
+        transitions = self._load_transition_memory()
+        if not transitions:
+            return None, 0, {"transitions_loaded": 0, "trajectories_selected": 0}
+        # Policy horizon is model-derived. Generate candidates from each compatible
+        # initial snapshot; the policy sequence itself defines H.
+        candidates = []
+        score_by_index = {}
+        for index, transition in enumerate(transitions):
+            score = transition.get("surprise")
+            if score is None or not math.isfinite(self._scalar(score, float("nan"))):
+                score = 0.0
+            score_by_index[index] = float(score)
+            initial = transition.get("initial_state", {})
+            try:
+                context, compatible = self._partial_transition_beliefs(initial)
+                if not compatible:
+                    continue
+                with self._using_beliefs(context):
+                    policy_inputs = {
+                        key: (value.detach().clone() if torch.is_tensor(value) else deepcopy(value))
+                        for key, value in self.agent.inputs_map.items()
+                    }
+                    policy_candidates = model_components.get_policy_candidates(
+                        self.agent.navigator, self.agent.functions_map, policy_inputs,
+                        self.agent.states_list, self.agent.Q_,
+                    )
+                has_full_chain = False
+                for policy_candidate in policy_candidates.values():
+                    policy_output = getattr(policy_candidate, "policy", None)
+                    if policy_output is None or getattr(policy_output, "policy", None) is None:
+                        continue
+                    policy_tensor = policy_output.policy
+                    sequence = policy_tensor[0] if policy_tensor.ndim >= 3 else policy_tensor
+                    horizon = int(sequence.shape[0])
+                    chains = self._transition_chains(transitions[index:], horizon)
+                    if chains and chains[0][0] == 0:
+                        has_full_chain = True
+                        break
+                if has_full_chain:
+                    candidates.append((index, transition, policy_candidates))
+            except Exception:
+                continue
+        capacity = int(self.config.transition_memory_capacity)
+        effective_k = min(max(1, int(self.top_k)), capacity, len(candidates))
+        candidates.sort(key=lambda item: score_by_index.get(item[0], 0.0), reverse=True)
+        selected = candidates[:effective_k]
+        losses = []
+        trajectory_count = 0
+        used_starts = []
+        for index, transition, policy_candidates in selected:
+            for policy_state, candidate in policy_candidates.items():
+                policy_output = getattr(candidate, "policy", None)
+                if policy_output is None or getattr(policy_output, "policy", None) is None:
+                    continue
+                policy_tensor = policy_output.policy
+                sequence = policy_tensor[0] if policy_tensor.ndim >= 3 else policy_tensor
+                horizon = int(sequence.shape[0])
+                chains = self._transition_chains(transitions[index:], horizon)
+                if not chains or chains[0][0] != 0:
+                    continue
+                chain = chains[0][1]
+                rollout_losses, steps = self._dream_trajectory_loss(
+                    transition, chain, policy_output, policy_state
+                )
+                if rollout_losses and steps == horizon:
+                    losses.extend(rollout_losses)
+                    trajectory_count += 1
+                    used_starts.append(index)
+        if not losses:
+            return None, 0, {
+                "transitions_loaded": len(transitions), "trajectories_selected": 0,
+                "top_k_effective": effective_k, "reason": "no_full_compatible_awake_sleep_chain",
+            }
+        # Sum over time, then average only over selected trajectories to keep scale
+        # independent of the number of Top-K samples while preserving sum_t within each.
+        temporal = torch.stack(losses).sum() / max(1, trajectory_count)
+        return temporal, trajectory_count, {
+            "transitions_loaded": len(transitions), "trajectories_selected": trajectory_count,
+            "top_k_effective": effective_k, "trajectory_start_indices": used_starts,
+            "horizon_source": "policy_sequence_length",
+        }
+
+    def _optimize_temporal_world_model(self):
+        groups = self._parameter_groups()
+        if not groups:
+            return {"updated": False, "loss": None, "pairs": 0, "parameters": 0}
+        signature = tuple(tuple(id(p) for p in g["params"]) for g in groups)
+        if self._optimizer is None or signature != self._optimizer_signature:
+            self._optimizer = torch.optim.AdamW(groups, weight_decay=self.config.weight_decay)
+            self._optimizer_signature = signature
+            if self._pending_optimizer_state is not None:
+                self._optimizer.load_state_dict(self._pending_optimizer_state)
+                self._pending_optimizer_state = None
+        self._optimizer.zero_grad(set_to_none=True)
+        temporal, trajectories, info = self._temporal_loss()
+        if temporal is None or not temporal.requires_grad or not torch.isfinite(temporal):
+            return {"updated": False, "loss": None, "pairs": 0,
+                    "trajectories": trajectories, "parameters": 0, **info}
+        loss = float(self.config.temporal_loss_weight) * temporal
+        loss.backward()
+        parameters = [p for g in groups for p in g["params"] if p.grad is not None]
+        if parameters:
+            torch.nn.utils.clip_grad_norm_(parameters, self.config.gradient_clip)
+            self._optimizer.step()
+        return {
+            "updated": bool(parameters), "loss": self._scalar(temporal),
+            "weighted_loss": self._scalar(loss), "pairs": trajectories,
+            "trajectories": trajectories,
+            "parameters": sum(p.numel() for p in parameters), **info,
+        }
+
+    def _candidate_structures(self):
+        from .offline_architecture import OfflineArchitecture
+        architecture = OfflineArchitecture(self.agent, self.config)
+        candidates = []
+        states = [
+            name for name, node in self.agent.navigator.graph.items()
+            if node.get("type") == "state"
+        ]
+        for state in states:
+            constraint = architecture._constraint(state)
+            if constraint["allow_coordinates"]:
+                count = architecture._coordinate_count(self.agent.D[state]["mu"])
+                if count > int(constraint["min_coordinates"]):
+                    candidates.append({"action": "remove_low_utility_coordinate", "target": state,
+                                       "kind": "coordinate"})
+            if constraint["allow_under_state"]:
+                count = architecture._under_state_count(self.agent.D[state]["mu"])
+                if count > int(constraint["min_under_state"]):
+                    candidates.append({"action": "remove_under_state", "target": state,
+                                       "kind": "under_state"})
+            if constraint["allow_removal"] and len(states) > 1:
+                candidates.append({"action": "remove_redundant_state", "target": state,
+                                   "kind": "state"})
+            if constraint["allow_hierarchy_removal"] and len(states) > 1:
+                candidates.append({"action": "remove_redundant_hierarchy_layer", "target": state,
+                                   "kind": "hierarchy"})
+            if constraint["allow_intermediate_layers"]:
+                state_id = self.agent.states_list.index(state) + 1
+                layer_id = int(self.agent.generative_functions[state].get("layer", 0))
+                modules = {id(v): v for v in (self.agent.functions_map or {}).values()
+                           if isinstance(v, nn.Module) and hasattr(v, "local_context_layer_count")}
+                layer_count = max(
+                    (m.local_context_layer_count(state_id, layer_id) for m in modules.values()),
+                    default=0,
+                )
+                if layer_count > int(constraint["min_intermediate_layers"]):
+                    candidates.append({"action": "prune_intermediate_layer", "target": state,
+                                       "kind": "layer"})
+        if states:
+            candidates.insert(0, {"action": "prune_neurons", "target": states[0], "kind": "neuron"})
+        return candidates
+
+    def _snapshot_agent_for_trial(self):
+        # Keep the trainer identity out of the deepcopy to avoid copying the
+        # optimizer/controller cycle; deepcopy preserves shared module aliases.
+        state = {k: v for k, v in self.agent.__dict__.items() if k != "_offline_trainer"}
+        return deepcopy(state)
+
+    def _restore_agent_trial(self, snapshot):
+        trainer = self
+        self.agent.__dict__.clear()
+        self.agent.__dict__.update(snapshot)
+        self.agent._offline_trainer = trainer
+        self.invalidate_optimizer()
+
+    def _evaluate_current_agent(self, frames):
+        initial = self._snapshot_beliefs()
+        contexts = self._build_belief_contexts(frames, initial)
+        value, metrics = self._evaluate(contexts)
+        return value, metrics
+
+    def _apply_one_structure(self, candidate):
+        from .offline_architecture import OfflineArchitecture
+        return OfflineArchitecture(self.agent, self.config).apply([candidate])
+
+    def _precision_for_candidate(self, candidate):
+        target = candidate.get("target")
+        if candidate.get("kind") in {"coordinate", "under_state", "state", "hierarchy", "layer"}:
+            return self._state_precision(target)
+        return self._global_precision()
+
+    @staticmethod
+    def _candidate_free_energy(candidate, metrics, global_value):
+        kind = candidate.get("kind")
+        target = candidate.get("target")
+        if kind in {"coordinate", "under_state", "layer"} and target in metrics:
+            return float(metrics[target].free_energy)
+        return float(global_value)
+
+    def _restart_learning_cycle(self):
+        self.macro_phase = 1
+        self._hierarchical_done = False
+        self._temporal_done = False
+        self._hierarchical_history.clear()
+        self._temporal_history.clear()
+        self._structural_candidates = []
+        self._structural_cursor = 0
+        self._retained_candidates = []
+        self._creation_cursor = 0
+        self._macro_cycles += 1
+        self.invalidate_optimizer()
+
+    def _structural_step(self, test_frames):
+        if not self._structural_candidates:
+            self._structural_candidates = self._candidate_structures()
+            self._structural_cursor = 0
+            self._retained_candidates = []
+        if self._structural_cursor < len(self._structural_candidates):
+            candidate = deepcopy(self._structural_candidates[self._structural_cursor])
+            self._structural_cursor += 1
+            snapshot = self._snapshot_agent_for_trial()
+            before_global, before_metrics = self._evaluate_current_agent(test_frames)
+            before = self._candidate_free_energy(candidate, before_metrics, before_global)
+            result = self._apply_one_structure(candidate)
+            if not result.get("applied"):
+                self._structural_log.append({
+                    "operation": candidate, "accepted": False,
+                    "reason": result.get("skipped", []), "F_before": before,
+                })
+                return {"operation": candidate, "accepted": False, "reason": "not_applicable",
+                        "architecture_result": result}
+            after_global, after_metrics = self._evaluate_current_agent(test_frames)
+            after = self._candidate_free_energy(candidate, after_metrics, after_global)
+            delta = after - before
+            threshold = 1.0 / self._precision_for_candidate(candidate)
+            useful = delta > threshold
+            if useful:
+                self._restore_agent_trial(snapshot)
+                self._retained_candidates.append(candidate)
+                outcome = "retained_component"
+                accepted = False
+            else:
+                self.invalidate_optimizer()
+                outcome = "component_removed_restart_learning"
+                accepted = True
+                self._restart_learning_cycle()
+            record = {
+                "operation": candidate, "accepted": accepted, "outcome": outcome,
+                "F_before": before, "F_after": after if not useful else before,
+                "delta_F": delta, "precision": self._precision_for_candidate(candidate),
+                "threshold": threshold,
+            }
+            self._structural_log.append(record)
+            return record
+
+        # All candidate deletions were tested and retained. Try duplicating one
+        # of those structures, exactly one creation per restructuring cycle.
+        if self._retained_candidates and self._creation_cursor < len(self._retained_candidates):
+            source = self._retained_candidates[self._creation_cursor]
+            self._creation_cursor += 1
+            add_actions = {
+                "neuron": "add_neurons",
+                "coordinate": "add_generalized_coordinate",
+                "under_state": "add_under_state",
+                "state": "add_state",
+                "hierarchy": "add_hierarchy_layer",
+                "layer": "add_intermediate_layer",
+            }
+            creation = {"action": add_actions[source["kind"]], "target": source["target"],
+                        "kind": source["kind"]}
+            snapshot = self._snapshot_agent_for_trial()
+            before, _ = self._evaluate_current_agent(test_frames)
+            result = self._apply_one_structure(creation)
+            if result.get("applied"):
+                after, _ = self._evaluate_current_agent(test_frames)
+                gain = before - after
+                success = gain > self._global_precision()
+            else:
+                after, gain, success = before, 0.0, False
+            if success:
+                self.invalidate_optimizer()
+                outcome = "capacity_added_restart_learning"
+                self._restart_learning_cycle()
+            else:
+                self._restore_agent_trial(snapshot)
+                outcome = "capacity_addition_rejected"
+            record = {
+                "operation": creation, "accepted": success, "outcome": outcome,
+                "F_before": before, "F_after": after if success else before,
+                "delta_F": before - after, "global_precision": self._global_precision(),
+                "architecture_result": result,
+            }
+            self._structural_log.append(record)
+            return record
+
+        return {"operation": None, "accepted": False,
+                "outcome": (
+                    "all_capacity_additions_rejected"
+                    if self._retained_candidates else "no_structural_candidate_available"
+                )}
+
+    def step(
+        self,
+        observations: dict | list[dict] | tuple[dict, ...],
+        *,
+        test_observations: dict | list[dict] | tuple[dict, ...] | None = None,
+        rebuild_callback: Callable | None = None,
+        motor_fn: Callable | None = None,
+        motor_train_fn: Callable | None = None,
+    ) -> dict[str, Any]:
+        """Run one offline cycle: phase I and II use their own persistent memories.
+
+        Observation frames are consumed only by the hierarchical objective.
+        Temporal Dreamer loss and policy optimization read transition memory only.
+        """
+        self._validate_config()
+        self.agent.inference_memory_path = self.config.inference_memory_path
+        self.agent.transition_memory_path = self.config.transition_memory_path
+        self.agent.inference_memory_capacity = int(self.config.inference_memory_capacity)
+        self.agent.transition_memory_capacity = int(self.config.transition_memory_capacity)
+        self.agent.inference_memory_old_fraction = float(self.config.inference_memory_old_fraction)
+        if self.agent.navigator is None:
+            raise RuntimeError("Call Agent_DAIH.model() before training_offline().")
+        if self.config.train_motor and motor_fn is None:
+            raise ValueError("train_motor=True requires a user-supplied motor_fn.")
+        if self.config.train_motor and not callable(motor_train_fn):
+            raise ValueError("train_motor=True requires motor_train_fn(records, observations).")
+        if motor_fn is not None and self.config.observation_mode != "temporal":
+            raise ValueError("A motor_fn requires observation_mode='temporal'.")
+
+        online_reference = self._read_online_free_energy_reference()
+        new_frames = self._normalize_observations(observations)
+        frames = self._merge_inference_memory(new_frames)
+        # Evaluation defaults to the caller's current batch, not the bounded
+        # observation replay memory. This keeps phase-II training isolated.
+        test_frames = new_frames if test_observations is None else self._normalize_observations(test_observations)
+        self.iteration += 1
+        initial_beliefs = self._snapshot_beliefs()
+        motor_trace = []
+        contexts = self._build_belief_contexts(
+            frames, initial_beliefs, motor_fn=motor_fn, motor_trace=motor_trace
+        )
+        test_contexts = self._build_belief_contexts(
+            test_frames, initial_beliefs, motor_fn=motor_fn
+        )
+        F_before, _ = self._evaluate(test_contexts)
+        checkpoint_path = self._checkpoint_before(F_before)
+        best_updated = self._consider_best_agent(F_before)
+
+        structural = None
+        hierarchical = {"updated": False, "loss": None}
+        temporal = {"updated": False, "loss": None}
+        policy = {"updated": False, "loss": None}
+        top_k_info = {"top_k_requested": int(self.top_k), "top_k_effective": 0}
+        temporal_surprises = []
+        phase_checkpoints = {}
+
+        if self.macro_phase in (1, 2):
+            # PHASE I — observation memory only.
+            selected, top_k_info = self._select_surprising_contexts(contexts)
+            hierarchical = self._optimize_world_model(selected)
+            F_hierarchical, _ = self._evaluate(selected)
+            self._hierarchical_history.append(float(F_hierarchical))
+            status_h = self._objective_status(
+                self._hierarchical_history, self._global_precision()
+            )
+            phase_checkpoints["phase_1"] = self._checkpoint_phase_end(
+                1, self.MACRO_NAMES[1]
+            )
+
+            # PHASE II — transition memory only. No observation contexts or raw
+            # observation frames are passed into either temporal or policy loss.
+            self._temporal_surprise_trace = []
+            temporal = self._optimize_temporal_world_model()
+            temporal_surprises = sorted(
+                self._temporal_surprise_trace,
+                key=lambda item: item["surprise"], reverse=True,
+            )
+            start_indices = temporal.get("trajectory_start_indices", [])
+            stored_transitions = self._load_transition_memory()
+            policy_results = []
+            for transition_index in sorted(set(start_indices)):
+                if transition_index < 0 or transition_index >= len(stored_transitions):
+                    continue
+                initial_snapshot = stored_transitions[transition_index].get("initial_state", {})
+                context, compatible = self._partial_transition_beliefs(initial_snapshot)
+                if not compatible:
+                    continue
+                with self._using_beliefs(context):
+                    # Empty observation overlay: policy inputs come from the
+                    # compatible stored transition initial state only.
+                    policy_results.append(self._optimize_policy({}))
+            policy = self._mean_policy_results(policy_results)
+            temporal_value = temporal.get("loss")
+            if temporal_value is None:
+                status_t = "active"
+            else:
+                self._temporal_history.append(float(temporal_value))
+                temporal_precision = float(
+                    self.config.temporal_precision or self._global_precision()
+                )
+                status_t = self._objective_status(
+                    self._temporal_history, temporal_precision
+                )
+            self._last_temporal_loss = temporal_value
+            joint_status, joint_details = self._joint_macro_status()
+            self._hierarchical_done = joint_status in {"converged", "diverged"}
+            self._temporal_done = self._hierarchical_done
+            F_after, metrics_after = self._evaluate(test_contexts)
+            if self._hierarchical_done and self.config.enable_structural_phase:
+                self.macro_phase = 3
+            phase_info = {
+                "macro_phase": self.macro_phase,
+                "macro_phase_name": self.MACRO_NAMES[self.macro_phase],
+                "hierarchical": {
+                    "status": status_h,
+                    "objective": F_hierarchical,
+                    "top_k": top_k_info,
+                    "done": self._hierarchical_done,
+                },
+                "temporal": {
+                    "status": status_t,
+                    "objective": temporal_value,
+                    "done": self._temporal_done,
+                    "trajectories": temporal.get("trajectories", 0),
+                    "details": {k: v for k, v in temporal.items()
+                                if k not in {"loss", "weighted_loss"}},
+                },
+                "joint_status": joint_status,
+                "joint_details": joint_details,
+                "most_surprising_transitions": temporal_surprises[:max(1, self.top_k)],
+            }
+        else:
+            # PHASE III — structural tests use the caller's explicit evaluation
+            # batch, not the phase-I/II training memories.
+            F_after, metrics_after = self._evaluate(test_contexts)
+            structural = self._structural_step(test_frames)
+            if structural.get("accepted"):
+                F_after, metrics_after = self._evaluate_current_agent(test_frames)
+            phase_info = {
+                "macro_phase": self.macro_phase,
+                "macro_phase_name": self.MACRO_NAMES[self.macro_phase],
+                "structural": structural,
+            }
+
+        # Top-K progression is referenced to all online inferences since the
+        # previous offline run, not to the mean of the current replay batch.
+        online_mean = online_reference.get("mean")
+        top_k_progression = {
+            "online_inferences": int(online_reference.get("count", 0)),
+            "online_mean_free_energy": online_mean,
+            "offline_final_free_energy": float(F_after),
+            "global_precision": self._global_precision(),
+            "advanced": False,
+        }
+        if online_mean is not None:
+            residual = float(F_after) - float(online_mean)
+            advanced = residual > self._global_precision()
+            top_k_progression["residual_offline_minus_online"] = residual
+            top_k_progression["advanced"] = advanced
+            top_k_progression["top_k_before"] = int(self.top_k)
+            if advanced:
+                max_k = max(
+                    int(self.config.inference_memory_capacity),
+                    int(self.config.transition_memory_capacity),
+                )
+                self.top_k = min(max_k, int(self.top_k) + int(self.config.top_k_step))
+            top_k_progression["top_k_after"] = int(self.top_k)
+        top_k_info["progression_reference"] = top_k_progression
+
+        # Save the complete agent after the corresponding phase has finished.
+        # Phase I is saved immediately after its own update above; phase II/III
+        # are saved here so their checkpoints include the final Top-K controller state.
+        if "phase_1" in phase_checkpoints:
+            phase_checkpoints["phase_2"] = self._checkpoint_phase_end(
+                2, self.MACRO_NAMES[2]
+            )
+        elif structural is not None:
+            phase_checkpoints["phase_3"] = self._checkpoint_phase_end(
+                3, self.MACRO_NAMES[3]
+            )
+
+        motor_optimization = {"updated": False, "disabled": True}
+        if self.config.train_motor:
+            motor_optimization = motor_train_fn(
+                deepcopy(motor_trace), deepcopy(frames)
+            )
+            if motor_optimization is None:
+                motor_optimization = {"updated": True, "result": None}
+
+        self.last_metrics = metrics_after
+        best_updated = self._consider_best_agent(F_after) or best_updated
+        final_checkpoint_path = self._checkpoint_after(F_after)
+        plan = {
+            "version": "12.0",
+            "paradigm": "awake_belief_vs_dream_trajectory_with_separate_memories",
+            "iteration": self.iteration,
+            "macro_cycles": self._macro_cycles,
+            "macro_phase": self.macro_phase,
+            "macro_phase_name": self.MACRO_NAMES[self.macro_phase],
+            "top_k": self.top_k,
+            "top_k_progression": deepcopy(top_k_progression),
+            "inference_memory": deepcopy(self._last_replay_info),
+            "online_free_energy_reference": deepcopy(online_reference),
+            "temporal_surprise_trace": deepcopy(self._temporal_surprise_trace),
+            "F_global_test_before": F_before,
+            "F_global_test_after": F_after,
+            "delta_F_global_test": F_after - F_before,
+            "hierarchical_optimization": hierarchical,
+            "temporal_optimization": temporal,
+            "policy_optimization": policy,
+            "motor_optimization": motor_optimization,
+            "structural": structural,
+            "phase_status": phase_info,
+            "phase_checkpoints": phase_checkpoints,
+            "q_updated_offline": False,
+        }
+        plan_path = self._write_plan(plan)
+        # Reset only after the whole offline call and its checkpoints succeeded.
+        self._reset_online_free_energy_reference()
+        return {
+            "iteration": self.iteration,
+            "paradigm": "daih_offline_v12",
+            "macro_phase": self.macro_phase,
+            "macro_phase_name": self.MACRO_NAMES[self.macro_phase],
+            "macro_cycles": self._macro_cycles,
+            "hierarchical_optimization": hierarchical,
+            "temporal_optimization": temporal,
+            "policy_optimization": policy,
+            "motor_optimization": motor_optimization,
+            "motor_trace": deepcopy(motor_trace),
+            "structural": structural,
+            "phases": phase_info,
+            "states": {name: metric.to_dict() for name, metric in metrics_after.items()},
+            "F_global_test_before": F_before,
+            "F_global_test_after": F_after,
+            "delta_F_global_test": F_after - F_before,
+            "top_k": self.top_k,
+            "top_k_progression": top_k_progression,
+            "online_free_energy_reference": online_reference,
+            "inference_memory": deepcopy(self._last_replay_info),
+            "temporal_surprise_trace": deepcopy(self._temporal_surprise_trace),
+            "q_updated_offline": False,
+            "checkpoint_path": checkpoint_path,
+            "final_checkpoint_path": final_checkpoint_path,
+            "phase_checkpoints": phase_checkpoints,
+            "best_agent_updated": best_updated,
+            "best_free_energy": self.best_free_energy,
+            "best_iteration": self.best_iteration,
+            "best_agent_checkpoint_path": self.best_checkpoint_path,
+            "plan_path": plan_path,
+            "structural_log": deepcopy(self._structural_log[-20:]),
+        }
+
