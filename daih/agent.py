@@ -1,15 +1,76 @@
 import torch
 from . import utils, model, preprocessing, inference, model_components
-import math, copy
+import math
+import copy
 from pathlib import Path
 import os
 import tempfile
 
-# Deep Active Inference Hybride Framework with Dynamic Planning Horizon and Amortized Active Inference (DAIH-DynAmI)
-class Agent_DAIH():
-    def __init__(self):
+
+# Deep Active Inference Hybride Framework with Dynamic Planning Horizon
+# and Amortized Active Inference (DAIH-DynAmI)
+class Agent_DAIH:
+    def __init__(
+        self,
+        *,
+        max_grad_norm=5.0,
+        min_state_value=-1e+3,
+        max_state_value=1e+3,
+        min_observation_value=-1e+3,
+        max_observation_value=1e+3,
+        observation_bounds=None,
+        min_reward_value=-1e+2,
+        max_reward_value=1e+2,
+        min_precision=1e-4,
+        max_precision=1e+4,
+        min_obs_precision=1e-4,
+        max_obs_precision=1e+4,
+        min_policy_precision=1e-4,
+        max_policy_precision=1e+4,
+        max_policy_error=10,
+        numerical_eps=1e-6,
+    ):
         self.D = None
-    
+
+        # Numerical limits: configurable when the agent is instantiated.
+        self.max_grad_norm = max_grad_norm
+        self.min_state_value = min_state_value
+        self.max_state_value = max_state_value
+        self.min_observation_value = min_observation_value
+        self.max_observation_value = max_observation_value
+        self._observation_bounds_config = (
+            {} if observation_bounds is None else copy.deepcopy(observation_bounds)
+        )
+        self.observation_bounds = {}
+        self.min_reward_value = min_reward_value
+        self.max_reward_value = max_reward_value
+        self.min_precision = min_precision
+        self.max_precision = max_precision
+        self.min_obs_precision = min_obs_precision
+        self.max_obs_precision = max_obs_precision
+        self.min_policy_precision = min_policy_precision
+        self.max_policy_precision = max_policy_precision
+        self.max_policy_error = max_policy_error
+        self.numerical_eps = numerical_eps
+
+        model.validate_agent_parameters(
+            max_grad_norm=self.max_grad_norm,
+            min_state_value=self.min_state_value,
+            max_state_value=self.max_state_value,
+            min_observation_value=self.min_observation_value,
+            max_observation_value=self.max_observation_value,
+            min_reward_value=self.min_reward_value,
+            max_reward_value=self.max_reward_value,
+            min_precision=self.min_precision,
+            max_precision=self.max_precision,
+            min_obs_precision=self.min_obs_precision,
+            max_obs_precision=self.max_obs_precision,
+            min_policy_precision=self.min_policy_precision,
+            max_policy_precision=self.max_policy_precision,
+            max_policy_error=self.max_policy_error,
+            numerical_eps=self.numerical_eps,
+        )
+
         self.pi_obs = {}
         self.covariances = None
         self.state_priors = None
@@ -33,9 +94,6 @@ class Agent_DAIH():
         self.lr_policies = 1
         self.lr_obs = 1
 
-        # Persistent bounded sample of observations seen during online inference.
-        # Two independent persistent replay memories: surprising observations
-        # (phase I) and surprising transitions (phase II).
         self.inference_memory_path = "offline_artifacts/observation_memory.pt"
         self.transition_memory_path = "offline_artifacts/transition_memory.pt"
         self.inference_memory_capacity = 256
@@ -44,26 +102,34 @@ class Agent_DAIH():
         self.initial_top_k = 1
         self._pending_transition = None
         self._last_inference_free_energy = {}
-    
-    
-    def model(self, generative_functions=None, functions_map=None, observations=None, actions=None, pi_p=None):
-        # Keep the declarative model inputs available to offline architecture
-        # rebuilding and exact checkpoint restoration.
+
+    def model(self, generative_functions=None, functions_map=None,
+              observations=None, actions=None, pi_p=None):
         if generative_functions is not None:
             self.generative_functions = generative_functions
         elif not hasattr(self, "generative_functions"):
             self.generative_functions = {}
+
         if observations is not None:
             self.observations = observations
         elif not hasattr(self, "observations"):
             self.observations = {}
+
         if actions is not None:
             self.actions = actions
         elif not hasattr(self, "actions"):
             self.actions = {}
+
         generative_functions = self.generative_functions
         observations = self.observations
         actions = self.actions
+
+        self.observation_bounds = model.init_observation_bounds(
+            observations,
+            self._observation_bounds_config,
+            self.min_observation_value,
+            self.max_observation_value,
+        )
 
         states = model.validate_model(self.D, generative_functions, actions)
         _, idx_to_actions = model.actions_index(actions)
@@ -79,29 +145,30 @@ class Agent_DAIH():
             self.pi_states,
         ) = model.init_distributions(self.D, states, self.pi_states)
 
-        self.graph, navigator, self.functions_map = model.init_graph(self.graph, generative_functions, functions_map, observations, actions)
-
+        self.graph, navigator, self.functions_map = model.init_graph(
+            self.graph, generative_functions, functions_map, observations, actions
+        )
         if navigator is not None:
             self.navigator = navigator
 
         self.pi_priors = model.init_relation_priors(self.navigator, self.pi_states)
-
-        self.inputs_map = preprocessing.sync_state_inputs(self.D, self.Q_, self.inputs_map)
-
+        self.inputs_map = preprocessing.sync_state_inputs(
+            self.D, self.Q_, self.inputs_map
+        )
         utils.init_actions(actions, self.inputs_map)
 
-        self.pi_p, self.inputs_map = model.init_p(generative_functions, self.pi_states, pi_p, self.inputs_map)
-
+        self.pi_p, self.inputs_map = model.init_p(
+            generative_functions, self.pi_states, pi_p, self.inputs_map
+        )
         self.pi_threshold = model.sum_priors(self.pi_states, self.navigator)
-
-
-
 
     @staticmethod
     def _atomic_torch_save(payload, path):
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        fd, temp_name = tempfile.mkstemp(prefix=path.name, suffix=".tmp", dir=str(path.parent))
+        fd, temp_name = tempfile.mkstemp(
+            prefix=path.name, suffix=".tmp", dir=str(path.parent)
+        )
         os.close(fd)
         try:
             torch.save(payload, temp_name)
@@ -150,18 +217,25 @@ class Agent_DAIH():
         items = items if isinstance(items, list) else []
         payload.pop("_legacy_items", None)
         capacity = max(1, int(capacity))
-        old_fraction = min(.95, max(0., float(self.inference_memory_old_fraction)))
+        old_fraction = min(
+            .95, max(0., float(self.inference_memory_old_fraction))
+        )
         old_quota = min(len(items), int(round(capacity * old_fraction)))
         recent_quota = max(0, capacity - old_quota - 1)
         older_pool = items[:-recent_quota] if recent_quota else items
+
         if old_quota and older_pool:
             if old_quota == 1:
                 retained_old = [older_pool[0]]
             else:
-                indices = [round(i * (len(older_pool)-1)/(old_quota-1)) for i in range(old_quota)]
+                indices = [
+                    round(i * (len(older_pool) - 1) / (old_quota - 1))
+                    for i in range(old_quota)
+                ]
                 retained_old = [older_pool[i] for i in indices]
         else:
             retained_old = []
+
         recent = items[-recent_quota:] if recent_quota else []
         merged = (retained_old + recent + [copy.deepcopy(item)])[-capacity:]
         payload[key] = merged
@@ -175,14 +249,17 @@ class Agent_DAIH():
         payload = self._load_memory_payload(path)
         if "_legacy_items" in payload and "observations" not in payload:
             payload["observations"] = payload.pop("_legacy_items")
+
         stats = payload.get("online_free_energy_stats", {})
         if not isinstance(stats, dict):
             stats = {}
         if free_energy is None:
             return
+
         value = float(free_energy)
         if not math.isfinite(value):
             return
+
         stats["sum"] = float(stats.get("sum", 0.0)) + value
         stats["count"] = int(stats.get("count", 0)) + 1
         stats["mean"] = stats["sum"] / max(1, stats["count"])
@@ -198,6 +275,7 @@ class Agent_DAIH():
         result = {}
         source_q = (snapshot or {}).get("Q_", getattr(self, "Q_", {})) or {}
         state_names = list(source_q) or list(getattr(self, "states_list", []) or [])
+
         for state_name in state_names:
             distributions = source_q.get(state_name, [])
             dims = []
@@ -212,18 +290,25 @@ class Agent_DAIH():
                         dims.append(tuple(mean.shape))
                     except Exception:
                         dims.append(None)
-            result[str(state_name)] = {"under_states": len(distributions or []),
-                                       "distribution_shapes": dims}
+
+            result[str(state_name)] = {
+                "under_states": len(distributions or []),
+                "distribution_shapes": dims,
+            }
         return result
 
     def _record_inference_observation(self, observations, surprise=None):
         if not isinstance(observations, dict):
             return
-        item = {"observation": copy.deepcopy(observations),
-                "architecture": self._offline_memory_architecture(),
-                "surprise": float(surprise or 0.0)}
-        self._retain_memory_item(self.inference_memory_path, "observations", item,
-                                 self.inference_memory_capacity)
+        item = {
+            "observation": copy.deepcopy(observations),
+            "architecture": self._offline_memory_architecture(),
+            "surprise": float(surprise or 0.0),
+        }
+        self._retain_memory_item(
+            self.inference_memory_path, "observations", item,
+            self.inference_memory_capacity
+        )
 
     def _record_transition(self, initial_state, action, next_state, surprise=None):
         item = {
@@ -234,21 +319,31 @@ class Agent_DAIH():
                 "initial": self._offline_memory_architecture(initial_state),
                 "next": self._offline_memory_architecture(next_state),
             },
-            "surprise": float(surprise) if surprise is not None and math.isfinite(float(surprise)) else None,
+            "surprise": (
+                float(surprise)
+                if surprise is not None and math.isfinite(float(surprise))
+                else None
+            ),
         }
         self._retain_memory_item(
-            self.transition_memory_path, "transitions", item,
+            self.transition_memory_path,
+            "transitions",
+            item,
             getattr(self, "transition_memory_capacity", self.inference_memory_capacity),
         )
 
     def inference(self, observations):
-        (observations, self.pi_obs, self.pi_obs_substitued) = preprocessing.handle_missing_observations(
+        (
+            observations,
+            self.pi_obs,
+            self.pi_obs_substitued,
+        ) = preprocessing.handle_missing_observations(
             observations, self.pi_obs, self.pi_obs_substitued
         )
-        # The transition's next state is captured only after the new observation
-        # has updated beliefs. This preserves the order s_t -> a_t -> s_(t+1).
+
         for motors in self.beliefs_update(observations):
             yield f"action motor: {motors}"
+
         current_state = {
             "Q_": copy.deepcopy(self.Q_),
             "inputs_map": copy.deepcopy(self.inputs_map),
@@ -258,16 +353,21 @@ class Agent_DAIH():
             "pi_obs_substitued": copy.deepcopy(self.pi_obs_substitued),
             "pi_threshold": copy.deepcopy(self.pi_threshold),
         }
-        surprise_values = [v for v in self._last_inference_free_energy.values()
-                           if isinstance(v, (int, float)) and math.isfinite(v)]
-        # One online sample is the global F for this inference (sum over states).
+
+        surprise_values = [
+            value for value in self._last_inference_free_energy.values()
+            if isinstance(value, (int, float)) and math.isfinite(value)
+        ]
         observation_surprise = sum(surprise_values) if surprise_values else None
+
         if self._pending_transition is not None:
             self._record_transition(
                 self._pending_transition["initial_state"],
-                self._pending_transition.get("action"), current_state,
+                self._pending_transition.get("action"),
+                current_state,
                 surprise=observation_surprise,
             )
+
         self._accumulate_online_free_energy(observation_surprise)
         self._record_inference_observation(observations, observation_surprise)
 
@@ -276,240 +376,334 @@ class Agent_DAIH():
         self._pending_transition = {"initial_state": current_state, "action": action}
         yield f"policy selected: {policy_selected}"
 
-    # Continuous variational free energy
-    def free_energy(self, state_prior, state_posterior, D_poresterior, pi_prior, actual, pi_obs, gamma_obs, prediction):
+    def free_energy(
+        self,
+        state_prior,
+        state_posterior,
+        D_poresterior,
+        pi_prior,
+        actual,
+        pi_obs,
+        gamma_obs,
+        prediction,
+    ):
         def complexity(state_posterior, state_prior, gamma_obs, pi_prior):
-            return torch.sum(0.5*pi_prior*((state_posterior+D_poresterior-state_prior) ** 2)) - \
-            torch.sum(0.5*gamma_obs) - torch.sum(0.5*torch.log(pi_prior))
-        
-        def accuracy(actual, pi_obs, prediction):
-            return torch.sum(-0.5*pi_obs*((actual-prediction) ** 2))
+            return (
+                torch.sum(
+                    0.5 * pi_prior
+                    * ((state_posterior + D_poresterior - state_prior) ** 2)
+                )
+                - torch.sum(0.5 * gamma_obs)
+                - torch.sum(0.5 * torch.log(pi_prior))
+            )
 
-        return  complexity(state_posterior, state_prior, gamma_obs, pi_prior) - accuracy(actual, pi_obs, prediction)
+        def accuracy(actual, pi_obs, prediction):
+            return torch.sum(-0.5 * pi_obs * ((actual - prediction) ** 2))
+
+        return complexity(
+            state_posterior, state_prior, gamma_obs, pi_prior
+        ) - accuracy(actual, pi_obs, prediction)
 
     def beliefs_update(self, observations):
         self._last_inference_free_energy = {}
-        # Retrieve states level by level to start with level 1
         layers_list = self.navigator.layers()
+
         for layer in layers_list:
             states_of_layer = self.navigator.states_by_layer(layer)
             F_layer_list = []
             pi_priors_list = []
-            for state_name in states_of_layer:
-                # Data prprocessing
-                prepared = preprocessing.preprocessing_layer_for_free_energy(state_name, 
-                                                            self.navigator, self.functions_map, self.inputs_map, 
-                                                            self.Q_, self.pi_priors, 
-                                                            self.pi_obs, observations, self.states_list
-                                                            )
-                gamma_obs = torch.log(prepared["pi_obs"]).requires_grad_(True)
-                
-                # Free energy calcul
-                F = self.free_energy(
-                        prepared["state_prior"],
-                        prepared["state_posterior"].requires_grad_(True),
-                        prepared["f_transition"],
-                        prepared["pi_prior"].requires_grad_(True),
-                        prepared["actual"],
-                        prepared["pi_obs"],
-                        gamma_obs,
-                        prepared["prediction"].requires_grad_(True),
-                    )
 
-                # Keep a scalar diagnostic for the phase-I observation memory.
+            for state_name in states_of_layer:
+                prepared = preprocessing.preprocessing_layer_for_free_energy(
+                    state_name,
+                    self.navigator,
+                    self.functions_map,
+                    self.inputs_map,
+                    self.Q_,
+                    self.pi_priors,
+                    self.pi_obs,
+                    observations,
+                    self.states_list,
+                    state_min=self.min_state_value,
+                    state_max=self.max_state_value,
+                    observation_bounds=self.observation_bounds
+                )
+
+                gamma_obs = torch.log(prepared["pi_obs"]).requires_grad_(True)
+                F = self.free_energy(
+                    prepared["state_prior"],
+                    prepared["state_posterior"].requires_grad_(True),
+                    prepared["f_transition"],
+                    prepared["pi_prior"].requires_grad_(True),
+                    prepared["actual"],
+                    prepared["pi_obs"],
+                    gamma_obs,
+                    prepared["prediction"].requires_grad_(True)
+                )
+
                 try:
-                    self._last_inference_free_energy[state_name] = float(F.detach().cpu().item())
+                    self._last_inference_free_energy[state_name] = float(
+                        F.detach().cpu().item()
+                    )
                 except Exception:
                     self._last_inference_free_energy[state_name] = float("inf")
-                # command motors
+
                 motors = self.motor_command(state_name, F, prepared["prediction"])
 
-                # mean update
-                new_posterior = inference.euler_update(prepared["state_posterior"], 0.1, F)
+                new_posterior = inference.euler_update(
+                    prepared["state_posterior"],
+                    0.1,
+                    F,
+                    max_grad_norm=self.max_grad_norm,
+                )
 
-                # Π_obs update
-                self.pi_obs = inference.update_pi_obs(self.navigator, self.pi_obs, gamma_obs, F, self.Q_, state_name, 
-                                                      dt=0.1, lr_obs=self.lr_obs
-                                                    )
-                # re-init original size
-                new_posterior_init_size = new_posterior.reshape(prepared["state_posterior_init_size"].shape)
-                state_posterior_init_size = prepared["state_posterior"].reshape(prepared["state_posterior_init_size"].shape)
+                self.pi_obs = inference.update_pi_obs(
+                    self.navigator,
+                    self.pi_obs,
+                    gamma_obs,
+                    F,
+                    self.Q_,
+                    state_name,
+                    min_precision=self.min_obs_precision,
+                    max_precision=self.max_obs_precision,
+                    dt=0.1,
+                    lr_obs=self.lr_obs,
+                )
 
-                # covariance update
-                new_precision_hessian = inference.second_derivative_F(state_posterior_init_size, F)
+                new_posterior_init_size = new_posterior.reshape(
+                    prepared["state_posterior_init_size"].shape
+                )
+                state_posterior_init_size = prepared["state_posterior"].reshape(
+                    prepared["state_posterior_init_size"].shape
+                )
 
-                # update beliefs
-                Q = inference.update_distributions(new_precision_hessian.detach(), new_posterior_init_size.detach(), self.Q_[state_name], eps=1e-6)
+                new_precision_hessian = inference.second_derivative_F(
+                    state_posterior_init_size, F
+                )
+
+                Q = inference.update_distributions(
+                    new_precision_hessian.detach(),
+                    new_posterior_init_size.detach(),
+                    self.Q_[state_name],
+                    min_state_value=self.min_state_value,
+                    max_state_value=self.max_state_value,
+                    min_precision=self.min_precision,
+                    max_precision=self.max_precision,
+                    eps=self.numerical_eps,
+                )
                 self.Q_[state_name] = Q
 
-                # Π_prior update
-                inference.update_pi_prior(self.pi_states, self.pi_priors, new_precision_hessian, state_name, eps=1e-6)
+                inference.update_pi_prior(
+                    self.pi_states,
+                    self.pi_priors,
+                    new_precision_hessian,
+                    state_name,
+                    min_precision=self.min_precision,
+                    max_precision=self.max_precision,
+                    eps=self.numerical_eps,
+                )
+
                 if f"pi_{state_name}" in self.inputs_map:
                     self.inputs_map[f"pi_{state_name}"] = self.pi_states[state_name]
 
-                # F layer
                 F_layer_list.append(F)
                 pi_priors_list.append(prepared["pi_prior"])
 
                 if motors:
                     yield motors
 
-            # Π_threshold : 
             F_layer = torch.stack(F_layer_list).sum()
-            threshold = (1/F_layer) < self.pi_threshold[layer]
+            threshold = (1 / F_layer) < self.pi_threshold[layer]
 
-            new_pi_threshold = inference.update_threshold(pi_priors_list, F_layer_list, self.pi_threshold[layer], dt=0.1, k=1.0)
+            new_pi_threshold = inference.update_threshold(
+                pi_priors_list, F_layer_list,
+                self.pi_threshold[layer], dt=0.1, k=1.0
+            )
             self.pi_threshold[layer] = new_pi_threshold.detach()
 
             if not threshold:
                 break
 
-        # update for generative function inputs
-        self.inputs_map = preprocessing.sync_state_inputs(self.D, self.Q_, self.inputs_map)
+        self.inputs_map = preprocessing.sync_state_inputs(
+            self.D, self.Q_, self.inputs_map
+        )
 
-    
     def execepted_free_energy(self, pi_priors, variances, transition_cost):
         def excepted_ambiguity(pi_priors):
-            gaussian_entropy = (0.5*math.log(2*math.e*math.pi))
-            log_prior_precision = (0.5*torch.log(pi_priors))
-            return torch.sum(gaussian_entropy-log_prior_precision)
-        
+            gaussian_entropy = 0.5 * math.log(2 * math.e * math.pi)
+            log_prior_precision = 0.5 * torch.log(pi_priors)
+            return torch.sum(gaussian_entropy - log_prior_precision)
+
         def risk(variances, transition_cost):
             log_det = torch.logdet(2 * torch.pi * torch.e * variances)
             return torch.sum(0.5 * log_det - transition_cost)
 
         return excepted_ambiguity(pi_priors) + risk(variances, transition_cost)
-    
-    
+
     def policy_selection(self):
         i = 0
         while True:
             i += 1
             if i >= self.max_policies_iter:
                 raise RuntimeError(
-                    f"Policy selection exceeded the limit of {self.max_policies_iter} "
-                    f"iterations. Interrupted to prevent an infinite loop."
+                    f"Policy selection exceeded the limit of "
+                    f"{self.max_policies_iter} iterations. "
+                    "Interrupted to prevent an infinite loop."
                 )
-            #print("self.inputs_map : ", self.inputs_map)
-            policies_candidats = model_components.get_policy_candidates(self.navigator, self.functions_map, self.inputs_map, self.states_list, self.Q_)
+
+            policies_candidats = model_components.get_policy_candidates(
+                self.navigator,
+                self.functions_map,
+                self.inputs_map,
+                self.states_list,
+                self.Q_,
+            )
             admited_candidats = []
-            #print("policies_candidats: ", policies_candidats["life_expectancy"])
             is_policy_finded = False
+
             for state_name, policy_values in policies_candidats.items():
                 local_Q_ = copy.deepcopy(self.Q_)
                 local_inputs_map = copy.deepcopy(self.inputs_map)
 
                 for action_t in policy_values.policy.policy[0]:
-                    #print("action_t : ", action_t)
                     if torch.sum(action_t) != 1:
                         break
-                    # get all state that depends on this one-hot action "action_t"
-                    state_parents, action_name = preprocessing.get_one_hot_action_parents(action_t, self.actions_id, self.navigator)
+
+                    state_parents, action_name = (
+                        preprocessing.get_one_hot_action_parents(
+                            action_t, self.actions_id, self.navigator
+                        )
+                    )
 
                     for parent_of_action in state_parents:
+                        all_action_of_state = self.navigator.child_nodes(
+                            parent_of_action, node_type="action"
+                        )
 
-                        # get all action which "parent_of_action" state depends on
-                        all_action_of_state = self.navigator.child_nodes(parent_of_action, node_type="action")
-
-                        # pass state that not depends on "action_name" 
                         if action_name not in all_action_of_state:
                             continue
 
                         local_inputs_map[parent_of_action].requires_grad_(True)
-                        # get all actions vectors for "parent_of_action" function f inputs
-                        prepared = preprocessing.preprocessing_for_excepted_free_energy(all_action_of_state, action_name, parent_of_action, 
-                                                                                        local_inputs_map, self.pi_states, self.navigator, 
-                                                                                        self.functions_map, local_Q_, self.states_list
-                                                                            )
+                        prepared = preprocessing.preprocessing_for_excepted_free_energy(
+                            all_action_of_state,
+                            action_name,
+                            parent_of_action,
+                            local_inputs_map,
+                            self.pi_states,
+                            self.navigator,
+                            self.functions_map,
+                            local_Q_,
+                            self.states_list,
+                            state_min=self.min_state_value,
+                            state_max=self.max_state_value,
+                            observation_bounds=self.observation_bounds,
+                            reward_min=self.min_reward_value,
+                            reward_max=self.max_reward_value,
+                        )
 
+                        G_posterior = self.execepted_free_energy(
+                            prepared["pi_priors"],
+                            prepared["co_variances"],
+                            prepared["transition_cost"],
+                        )
 
-                        G_posterior = self.execepted_free_energy(prepared["pi_priors"], prepared["co_variances"], prepared["transition_cost"])
+                        new_precision = inference.seconde_derivative_from_output(
+                            prepared["temporal_pred"],
+                            local_inputs_map[parent_of_action],
+                            min_precision=self.min_precision,
+                            max_precision=self.max_precision,
+                            eps=self.numerical_eps,
+                        )
 
-                        # belief projected update
-                        new_precision = inference.seconde_derivative_from_output(prepared["temporal_pred"], local_inputs_map[parent_of_action])
-                        Q = inference.update_distributions(new_precision.detach(), prepared["temporal_pred"].detach(), local_Q_[parent_of_action], eps=1e-6)
+                        Q = inference.update_distributions(
+                            new_precision.detach(),
+                            prepared["temporal_pred"].detach(),
+                            local_Q_[parent_of_action],
+                            min_state_value=self.min_state_value,
+                            max_state_value=self.max_state_value,
+                            min_precision=self.min_precision,
+                            max_precision=self.max_precision,
+                            eps=self.numerical_eps,
+                        )
                         local_Q_[parent_of_action] = Q
 
-
-                # compare G_prior to G_posterior
                 G_prior = policy_values.policy.G
-                #print("G_prior: ", G_prior)
-                #print("G_posterior: ", G_posterior)
+
                 try:
                     pi_p = self.pi_p[state_name].requires_grad_(True)
-                    #print("pi_p: ", pi_p)
-                    error_eps = inference.policy_error(G_prior, G_posterior, pi_p)
-                    #print("error_eps: ", error_eps)
+                    error_eps = inference.policy_error(
+                        G_prior,
+                        G_posterior,
+                        pi_p,
+                        max_policy=self.max_policy_error,
+                    )
 
                     if error_eps <= 1:
-                        fist_action = policy_values.policy.policy[0][0]
-                        admited_candidats.append([fist_action, G_posterior])
-                    else: 
-                        self.inputs_map[f"error_{state_name}"] = torch.log(torch.tensor(1+1e-7+error_eps.detach().item()))
+                        first_action = policy_values.policy.policy[0][0]
+                        admited_candidats.append([first_action, G_posterior])
+                    else:
+                        print('error_eps : ', error_eps)
+                        self.inputs_map[f"error_{state_name}"] = error_eps.detach()
                 except UnboundLocalError:
                     pass
 
-            # Update Π_P
+            # Update policy precision using the last evaluated policy,
+            # as in the original implementation.
             try:
-                next_pi_p = utils.update_wih_grad_desc(pi_p, error_eps, dt=0.1, k=self.lr_policies)
-                self.pi_p[state_name] = torch.clamp(next_pi_p, min=1e-9, max=1e+6).detach()
+                next_pi_p = utils.update_wih_grad_desc(
+                    pi_p, error_eps, dt=0.1, k=self.lr_policies
+                )
+                self.pi_p[state_name] = torch.exp(next_pi_p.detach())
             except UnboundLocalError:
-                print("None policies")
                 break
 
-            # Sort the best policy candidat or update error_eps
             if admited_candidats:
-                best_candidat = min(admited_candidats, key=lambda x: x[1])
-                is_policy_finded = True 
+                best_candidat = min(admited_candidats, key=lambda item: item[1])
+                is_policy_finded = True
 
-            # Update the new action and init error for next time step
             if is_policy_finded:
-                action_group, new_action_oh = inference.update_current_action(best_candidat, self.actions_id, self.navigator)
+                action_group, new_action_oh = inference.update_current_action(
+                    best_candidat, self.actions_id, self.navigator
+                )
                 self.inputs_map[action_group[0]] = new_action_oh
-                self.inputs_map[f"error_{state_name}"] = self.pi_p[state_name].detach().item()
+                self.inputs_map[f"error_{state_name}"] = (
+                    self.pi_p[state_name].detach().item()
+                )
 
-                # get first action name
-                a_one_hot = policy_values.policy.policy[0][0] # fist action one-hot
-                #print("a_one_hot: ", a_one_hot)
-                #print("self.actions_id: ", self.actions_id)
-                _, first_action_name = preprocessing.get_one_hot_action_parents(a_one_hot, self.actions_id, self.navigator)
+                first_action = policy_values.policy.policy[0][0]
+                _, first_action_name = preprocessing.get_one_hot_action_parents(
+                    first_action, self.actions_id, self.navigator
+                )
 
-                return  {"action": first_action_name, # fist action name
-                            "G_prior": G_prior,
-                            "G_posterior": G_posterior.detach().item()
-                        }
+                return {
+                    "action": first_action_name,
+                    "G_prior": G_prior,
+                    "G_posterior": G_posterior.detach().item(),
+                }
 
-    
     def motor_command(self, current_state, F, g_output):
         states = self.navigator.states_with_motors()
-
         if current_state not in states:
             return {}
 
         motors_name = self.navigator.motors_by_state(current_state)
         outputs_g_name = self.navigator.output_g(current_state)
-
-        # Map each motor to its output index
         motors_indexes = [
-            (m, outputs_g_name.index(m))
-            for m in motors_name
-            if m in outputs_g_name
+            (motor, outputs_g_name.index(motor))
+            for motor in motors_name
+            if motor in outputs_g_name
         ]
 
         if not motors_indexes:
             return {}
 
-        # Descente de gradient sur le vecteur complet grad descente on complet output_g
-        new_y = utils.update_wih_grad_desc(g_output, F, dt=0.1, k=self.lr_motors)
-
-        # Keep only the envolved motors
+        new_y = utils.update_wih_grad_desc(
+            g_output, F, dt=0.1, k=self.lr_motors
+        )
         return {
             name: new_y[index].detach().item()
             for name, index in motors_indexes
         }
-
-
-    
 
     def training_offline(
         self,
@@ -529,10 +723,12 @@ class Agent_DAIH():
             trainer = OfflineTrainer(self, config=config)
             self._offline_trainer = trainer
         elif config is not None:
-            # Reuse controller state when resuming; update only the supplied
-            # configuration values rather than resetting progress.
             from .offline_training.offline import OfflineConfig
-            trainer.config = config if isinstance(config, OfflineConfig) else OfflineConfig(**config)
+            trainer.config = (
+                config
+                if isinstance(config, OfflineConfig)
+                else OfflineConfig(**config)
+            )
             trainer._validate_config()
 
         return trainer.step(

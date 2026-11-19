@@ -1,24 +1,104 @@
 from torch.func import jacrev
-from . import preprocessing
+from . import preprocessing, utils
 import torch, math
 
-def get_state_prediction(navigator, functions_map, inputs_map, state, states_list, Q_, Jacobian=None):
+def get_state_prediction(
+    navigator,
+    functions_map,
+    inputs_map,
+    state,
+    states_list,
+    Q_,
+    Jacobian=None,
+    *,
+    state_min,
+    state_max,
+    observation_bounds,
+):
     """
-    Computes g as a flattened numerical vector.
+    Execute g and flatten its outputs in output_g order.
 
-    Named outputs remain ordered by output_g. Optional masks are metadata and
-    are not concatenated into the numerical prediction vector.
+    State-valued outputs use state bounds. Observation outputs use the
+    bounds configured for their observation group.
     """
-    g_function_name = navigator.function(state, "g")
-    if g_function_name is None:
+    if navigator.function(state, "g") is None:
         raise ValueError(f"No g function is defined for state '{state}'.")
 
-    input_names = preprocessing.get_io_names(navigator, state, "g", "input")
+    input_names = preprocessing.get_io_names(
+        navigator, state, "g", "input"
+    )
     dict_inputs = preprocessing.prepare_inputs(input_names, inputs_map)
 
     def flattened_g(inputs):
-        return preprocessing.execute_flat_function(
-            navigator, functions_map, inputs, state, "g", states_list, "g", Q_
+        named_outputs = preprocessing.execute_named_function(
+            navigator,
+            functions_map,
+            inputs,
+            state,
+            "g",
+            states_list,
+            "g",
+            Q_,
+        )
+
+        bounded_outputs = []
+        for output_name, output in named_outputs.items():
+            output_node = navigator.graph.get(output_name)
+            output_type = (
+                output_node.get("type")
+                if output_node is not None
+                else None
+            )
+
+            if output_type == "state":
+                bounded = utils.smooth_bound(
+                    output, state_min, state_max
+                )
+
+            elif output_type == "observation":
+                group_name = output_node.get("group")
+                if group_name not in observation_bounds:
+                    raise KeyError(
+                        f"Missing observation bounds for group '{group_name}', "
+                        f"used by output '{output_name}'."
+                    )
+                bounds = observation_bounds[group_name]
+                bounded = utils.smooth_bound(
+                    output, bounds["min"], bounds["max"]
+                )
+
+            else:
+                # A declared output can be an observation group rather
+                # than an individual observation node.
+                group_observations = navigator.get_observations_by_group(
+                    output_name
+                )
+                if not group_observations:
+                    raise ValueError(
+                        f"Output '{output_name}' of g for state '{state}' "
+                        "is neither a state, an observation, nor a "
+                        "known observation group."
+                    )
+                if output_name not in observation_bounds:
+                    raise KeyError(
+                        f"Missing observation bounds for group '{output_name}'."
+                    )
+                bounds = observation_bounds[output_name]
+                bounded = utils.smooth_bound(
+                    output, bounds["min"], bounds["max"]
+                )
+
+            bounded_outputs.append(
+                preprocessing.as_flat_tensor(bounded)
+            )
+
+        if not bounded_outputs:
+            return torch.empty(0, dtype=torch.float32)
+
+        return (
+            torch.cat(bounded_outputs)
+            if len(bounded_outputs) > 1
+            else bounded_outputs[0]
         )
 
     predictions = flattened_g(dict_inputs)
@@ -179,12 +259,20 @@ def get_actual_precision(navigator, pi_obs, Q_, state):
 
 
 def get_transition_prediction(
-    navigator, functions_map, inputs_map, state, states_list, Q_,
-    recursive_input=None, policy=None
+    navigator,
+    functions_map,
+    inputs_map,
+    state,
+    states_list,
+    Q_,
+    recursive_input=None,
+    policy=None,
+    *,
+    state_min,
+    state_max,
 ):
     """
-    Executes f and returns a 1D vector, with outputs flattened and
-    concatenated in output_f order.
+    Execute f, flatten its first declared output, and apply state bounds.
     """
     local_inputs = dict(inputs_map)
     if recursive_input is not None:
@@ -201,10 +289,30 @@ def get_transition_prediction(
     if navigator.function(state, "f") is None:
         return None
 
-    return next(iter(preprocessing.execute_named_function(
-        navigator, functions_map, local_inputs, state, "f",
-        states_list, "f", Q_
-    ).values()))
+    named_outputs = preprocessing.execute_named_function(
+        navigator,
+        functions_map,
+        local_inputs,
+        state,
+        "f",
+        states_list,
+        "f",
+        Q_,
+    )
+    if not named_outputs:
+        raise ValueError(
+            f"Function f for state '{state}' returned no declared outputs."
+        )
+
+    prediction = preprocessing.as_flat_tensor(
+        next(iter(named_outputs.values()))
+    )
+
+    return utils.smooth_bound(
+        prediction,
+        state_min,
+        state_max,
+    )
 
 
 def get_policy_candidates(navigator, functions_map, inputs_map, state_list, Q_):
@@ -222,34 +330,38 @@ def get_policy_candidates(navigator, functions_map, inputs_map, state_list, Q_):
 
 
 
-def get_transition_cost(navigator, functions_map, inputs_map, state, states_list, Q_):
+def get_transition_cost(
+    navigator,
+    functions_map,
+    inputs_map,
+    state,
+    states_list,
+    Q_,
+    *,
+    state_min,
+    state_max,
+    observation_bounds,
+    reward_min,
+    reward_max,
+):
     """
-    Recursively propagates g predictions through the hierarchy,
-    collects predicted observations and assigns them to input_V.
+    Recursively propagate bounded g predictions, then evaluate bounded V.
 
-    Returns the flattened output of V, or None if V is not defined.
+    State outputs use state bounds, observation outputs use their group
+    bounds, and the final V output uses independent reward bounds.
     """
-
     if navigator.function(state, "V") is None:
         return None
 
-    # Work on a copy to avoid modifying the caller's inputs_map.
     local_inputs_map = dict(inputs_map)
-
     predicted_observations = []
 
     def predict_recursively(current_state):
-        """
-        Executes g for the current state and recursively propagates
-        predictions to its child states.
-        """
-
         if navigator.function(current_state, "g") is None:
             raise ValueError(
                 f"No g function is defined for state '{current_state}'."
             )
 
-        # Execute g and retrieve its outputs by their declared names.
         named_outputs = preprocessing.execute_named_function(
             navigator,
             functions_map,
@@ -258,12 +370,10 @@ def get_transition_cost(navigator, functions_map, inputs_map, state, states_list
             "g",
             states_list,
             "g",
-            Q_
+            Q_,
         )
 
-        # Traverse outputs in their declared order.
         for output_name, prediction in named_outputs.items():
-
             output_node = navigator.graph.get(output_name)
             output_type = (
                 output_node.get("type")
@@ -271,18 +381,38 @@ def get_transition_cost(navigator, functions_map, inputs_map, state, states_list
                 else None
             )
 
-            # Hierarchical output: propagate its prediction recursively.
             if output_type == "state":
-                local_inputs_map[output_name] = prediction
+                bounded_prediction = utils.smooth_bound(
+                    prediction, state_min, state_max
+                )
+                local_inputs_map[output_name] = bounded_prediction
                 predict_recursively(output_name)
+                continue
 
-            # Observation or terminal output: collect its prediction.
+            if output_type == "observation":
+                group_name = output_node.get("group")
             else:
-                predicted_observations.append(
-                    preprocessing.as_flat_tensor(prediction)
+                group_name = output_name
+                if not navigator.get_observations_by_group(group_name):
+                    raise ValueError(
+                        f"Output '{output_name}' of g for state "
+                        f"'{current_state}' is neither a state, an "
+                        "observation, nor a known observation group."
+                    )
+
+            if group_name not in observation_bounds:
+                raise KeyError(
+                    f"Missing observation bounds for group '{group_name}'."
                 )
 
-    # Start propagation from the state evaluated by V.
+            bounds = observation_bounds[group_name]
+            bounded_prediction = utils.smooth_bound(
+                prediction, bounds["min"], bounds["max"]
+            )
+            predicted_observations.append(
+                preprocessing.as_flat_tensor(bounded_prediction)
+            )
+
     predict_recursively(state)
 
     if not predicted_observations:
@@ -290,10 +420,7 @@ def get_transition_cost(navigator, functions_map, inputs_map, state, states_list
             f"No predicted observations were produced from state '{state}'."
         )
 
-    # Concatenate all predicted observations in traversal order.
     predicted_input = torch.cat(predicted_observations)
-
-    # Associate the prediction with the inputs declared for V.
     input_names_V = navigator.input_V(state)
 
     if len(input_names_V) != 1:
@@ -304,8 +431,7 @@ def get_transition_cost(navigator, functions_map, inputs_map, state, states_list
 
     local_inputs_map[input_names_V[0]] = predicted_input
 
-    # Execute V.
-    return preprocessing.execute_flat_function(
+    reward = preprocessing.execute_flat_function(
         navigator,
         functions_map,
         local_inputs_map,
@@ -313,9 +439,10 @@ def get_transition_cost(navigator, functions_map, inputs_map, state, states_list
         "V",
         states_list,
         "V",
-        Q_
+        Q_,
     )
 
+    return utils.smooth_bound(reward, reward_min, reward_max)
 
 
 def get_parent_g_predictions(

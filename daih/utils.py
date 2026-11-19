@@ -101,3 +101,69 @@ def get_keys_none(observation):
 
 def dict_keys_to_list(d: dict) -> list:
     return list(d.keys())
+
+def smooth_bound(x, min_value, max_value):
+    """
+    Transforms an unbounded variable into a variable strictly
+    bounded between min_value and max_value.
+
+    f(x) = min_value + (max_value - min_value) * sigmoid(x)
+    """
+    if min_value >= max_value:
+        raise ValueError("min_value must be lower than max_value.")
+
+    return min_value + (
+        max_value - min_value
+    ) * torch.sigmoid(x)
+
+
+def smooth_norm_limit(x, max_norm, eps=1e-12):
+
+    if max_norm <= 0:
+        raise ValueError("max_norm must be strictly positive.")
+
+    norm = torch.linalg.vector_norm(x)
+
+    ratio = norm / max_norm
+
+    scale = (
+        max_norm * torch.tanh(ratio)
+        / (norm + eps)
+    )
+
+    result = x * scale
+
+    return result
+
+
+def smooth_positive_matrix(matrix, min_eigenvalue, max_eigenvalue):
+    """
+    Transforms a symmetric matrix into a positive definite matrix
+    whose eigenvalues are strictly bounded.
+
+    The eigenvalues are transformed via a sigmoid function.
+    """
+    if not torch.isfinite(matrix).all():
+        raise ValueError("Matrix contains non-finite values.")
+
+    if min_eigenvalue <= 0:
+        raise ValueError("min_eigenvalue must be strictly positive.")
+
+    if min_eigenvalue >= max_eigenvalue:
+        raise ValueError("Invalid eigenvalue bounds.")
+
+    matrix = 0.5 * (matrix + matrix.transpose(-2, -1))
+
+    eigenvalues, eigenvectors = torch.linalg.eigh(matrix)
+
+    eigenvalues = smooth_bound(
+        eigenvalues,
+        min_eigenvalue,
+        max_eigenvalue
+    )
+
+    result = (
+        eigenvectors * eigenvalues.unsqueeze(-2)
+    ) @ eigenvectors.transpose(-2, -1)
+
+    return 0.5 * (result + result.transpose(-2, -1))

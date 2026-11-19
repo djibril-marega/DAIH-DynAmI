@@ -566,6 +566,9 @@ class _LegacyOfflineTrainer:
             self.agent.pi_obs,
             observations,
             self.agent.states_list,
+            state_min=self.agent.min_state_value,
+            state_max=self.agent.max_state_value,
+            observation_bounds=self.agent.observation_bounds,
         )
 
     def _state_objective(self, state_name: str, observations: dict):

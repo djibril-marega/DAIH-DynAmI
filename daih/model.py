@@ -1,6 +1,137 @@
+import math
 import torch
 import torch.distributions as dist
 from . import graph 
+
+
+def validate_agent_parameters(
+    *,
+    max_grad_norm,
+    min_state_value,
+    max_state_value,
+    min_observation_value,
+    max_observation_value,
+    min_reward_value,
+    max_reward_value,
+    min_precision,
+    max_precision,
+    min_obs_precision,
+    max_obs_precision,
+    min_policy_precision,
+    max_policy_precision,
+    max_policy_error,
+    numerical_eps,
+):
+    """Validate the numerical configuration used by Agent_DAIH."""
+
+    if not math.isfinite(float(max_grad_norm)) or max_grad_norm <= 0:
+        raise ValueError("max_grad_norm must be finite and strictly positive.")
+
+    if (
+        not math.isfinite(float(min_state_value))
+        or not math.isfinite(float(max_state_value))
+        or min_state_value >= max_state_value
+    ):
+        raise ValueError(
+            "State bounds must be finite and min_state_value "
+            "must be lower than max_state_value."
+        )
+
+    if (
+        not math.isfinite(float(min_observation_value))
+        or not math.isfinite(float(max_observation_value))
+        or min_observation_value >= max_observation_value
+    ):
+        raise ValueError(
+            "Observation bounds must be finite and min_observation_value "
+            "must be lower than max_observation_value."
+        )
+
+    if (
+        not math.isfinite(float(min_reward_value))
+        or not math.isfinite(float(max_reward_value))
+        or min_reward_value >= max_reward_value
+    ):
+        raise ValueError(
+            "Reward bounds must be finite and min_reward_value "
+            "must be lower than max_reward_value."
+        )
+
+    for name, lower, upper in (
+        ("state precision", min_precision, max_precision),
+        ("observation precision", min_obs_precision, max_obs_precision),
+        ("policy precision", min_policy_precision, max_policy_precision),
+    ):
+        if (
+            not math.isfinite(float(lower))
+            or not math.isfinite(float(upper))
+            or lower <= 0
+            or lower >= upper
+        ):
+            raise ValueError(
+                f"Invalid {name} bounds: expected finite values with 0 < min < max."
+            )
+
+    if not math.isfinite(float(max_policy_error)) or max_policy_error <= 0:
+        raise ValueError("max_policy_error must be finite and strictly positive.")
+
+    if not math.isfinite(float(numerical_eps)) or numerical_eps <= 0:
+        raise ValueError("numerical_eps must be finite and strictly positive.")
+
+
+def init_observation_bounds(
+    observations, observation_bounds, default_min, default_max
+):
+    """Validate and expand per-group observation bounds using model defaults."""
+    if not isinstance(observations, dict):
+        raise TypeError("observations must be a dictionary.")
+    if not isinstance(observation_bounds, dict):
+        raise TypeError("observation_bounds must be a dictionary.")
+
+    unknown_groups = set(observation_bounds) - set(observations)
+    if unknown_groups:
+        raise ValueError(
+            "observation_bounds contains unknown observation groups: "
+            f"{sorted(unknown_groups)}."
+        )
+
+    configured = {}
+    for group_name in observations:
+        bounds = observation_bounds.get(group_name, {})
+        if not isinstance(bounds, dict):
+            raise TypeError(
+                f"Bounds for observation group '{group_name}' "
+                "must be a dictionary with 'min' and 'max'."
+            )
+
+        unexpected_keys = set(bounds) - {"min", "max"}
+        if unexpected_keys:
+            raise ValueError(
+                f"Unknown bound keys for observation group '{group_name}': "
+                f"{sorted(unexpected_keys)}. Expected only 'min' and 'max'."
+            )
+
+        try:
+            lower = float(bounds.get("min", default_min))
+            upper = float(bounds.get("max", default_max))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"Bounds for observation group '{group_name}' must be numeric."
+            ) from exc
+
+        if not math.isfinite(lower) or not math.isfinite(upper):
+            raise ValueError(
+                f"Bounds for observation group '{group_name}' must be finite."
+            )
+        if lower >= upper:
+            raise ValueError(
+                f"Invalid bounds for observation group '{group_name}': "
+                "expected min < max."
+            )
+
+        configured[group_name] = {"min": lower, "max": upper}
+
+    return configured
 
 
 def sum_priors(pi_states, navigator):

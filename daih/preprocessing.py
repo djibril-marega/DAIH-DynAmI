@@ -2,13 +2,17 @@ from . import model_components, utils
 import torch, math, copy
 from collections.abc import Mapping
 
-def preprocessing_layer_for_free_energy(state_name, navigator, functions_map, inputs_map, Q_, pi_priors, pi_obs, observations, states_list):
+def preprocessing_layer_for_free_energy(
+    state_name, navigator, functions_map, inputs_map, Q_, pi_priors,
+    pi_obs, observations, states_list, *, state_min, state_max,
+    observation_bounds
+):
     """Prepare the quantities required for the variational free energy."""
     state_prior = model_components.get_parent_g_predictions(
         navigator, functions_map, inputs_map, state_name, states_list, Q_
     )
     f_transition = model_components.get_transition_prediction(
-        navigator, functions_map, inputs_map, state_name, states_list, Q_
+        navigator, functions_map, inputs_map, state_name, states_list, Q_, state_min=state_min, state_max=state_max
     ).reshape(1, -1)
 
     state_posterior = inputs_map[state_name].reshape(1, -1)
@@ -18,7 +22,15 @@ def preprocessing_layer_for_free_energy(state_name, navigator, functions_map, in
 
     actual = model_components.get_actual(navigator, Q_, state_name, observations)
     prediction = model_components.get_state_prediction(
-        navigator, functions_map, inputs_map, state_name, states_list, Q_
+        navigator,
+        functions_map,
+        inputs_map,
+        state_name,
+        states_list,
+        Q_,
+        state_min=state_min,
+        state_max=state_max,
+        observation_bounds=observation_bounds,
     )
     pi_obs_t = model_components.get_actual_precision(
         navigator, pi_obs, Q_, state_name
@@ -87,11 +99,23 @@ def get_one_hot_action_parents(action_one_hot, actions_id, navigator):
     return state_parents, action_name
 
 def preprocessing_for_excepted_free_energy(
-        all_action_of_state, action_name, parent_of_action, local_inputs_map, pi_states, navigator, functions_map, Q_, states_list
-    ):
+    all_action_of_state, action_name, parent_of_action, local_inputs_map,
+    pi_states, navigator, functions_map, Q_, states_list, *,
+    state_min, state_max, observation_bounds, reward_min, reward_max
+):
     f_action_inputs = actions_vectors_for_f(all_action_of_state, action_name, navigator)
     local_inputs_map |= f_action_inputs
-    temporal_pred = model_components.get_transition_prediction(navigator, functions_map, local_inputs_map, parent_of_action, states_list, Q_, policy=True)
+    temporal_pred = model_components.get_transition_prediction(
+        navigator,
+        functions_map,
+        local_inputs_map,
+        parent_of_action,
+        states_list,
+        Q_,
+        policy=True,
+        state_min=state_min,
+        state_max=state_max,
+    )
     outputs_f = navigator.output_f(parent_of_action)
     if len(outputs_f) == 1:
         local_inputs_map[outputs_f[0]] = temporal_pred
@@ -99,7 +123,19 @@ def preprocessing_for_excepted_free_energy(
         for output_f in outputs_f:
             local_inputs_map[output_f] = temporal_pred 
 
-    transition_cost = model_components.get_transition_cost(navigator, functions_map, local_inputs_map, parent_of_action, states_list, Q_)
+    transition_cost = model_components.get_transition_cost(
+        navigator,
+        functions_map,
+        local_inputs_map,
+        parent_of_action,
+        states_list,
+        Q_,
+        state_min=state_min,
+        state_max=state_max,
+        observation_bounds=observation_bounds,
+        reward_min=reward_min,
+        reward_max=reward_max,
+    )
     pi_state = pi_states[parent_of_action]
 
     list_co_variances = []
