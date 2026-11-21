@@ -642,7 +642,6 @@ class Agent_DAIH:
                         first_action = policy_values.policy.policy[0][0]
                         admited_candidats.append([first_action, G_posterior])
                     else:
-                        print('error_eps : ', error_eps)
                         self.inputs_map[f"error_{state_name}"] = error_eps.detach()
                 except UnboundLocalError:
                     pass
