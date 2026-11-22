@@ -302,8 +302,19 @@ class OfflineArchitecture:
             motor_groups = set(self.agent.actions or {}) & set(self.agent.observations or {})
             required_factors = []
             for output_name in (gf[target].get("output_g") or gf[target].get("outpu_g") or []):
-                for group, names_in_group in (self.agent.observations or {}).items():
-                    if output_name in names_in_group and group in motor_groups and group not in required_factors:
+                for group, declared in (self.agent.observations or {}).items():
+                    is_vector = (
+                        isinstance(declared, (list, tuple))
+                        and len(declared) == 1
+                        and isinstance(declared[0], int)
+                        and not isinstance(declared[0], bool)
+                    )
+                    observation_names = [group] if is_vector else declared
+                    if (
+                        output_name in observation_names
+                        and group in motor_groups
+                        and group not in required_factors
+                    ):
                         required_factors.append(group)
             if len(required_factors) > 1:
                 return None
@@ -351,11 +362,16 @@ class OfflineArchitecture:
                 # The inserted parent predicts non-motor observations. The
                 # target remains responsible for motor outputs, and its new
                 # parent exposes the motor factor in input_f.
-                motor_observations = {
-                    observation_name
-                    for group in required_factors
-                    for observation_name in (self.agent.observations or {}).get(group, [])
-                }
+                motor_observations = set()
+                for group in required_factors:
+                    declared = (self.agent.observations or {}).get(group, [])
+                    is_vector = (
+                        isinstance(declared, (list, tuple))
+                        and len(declared) == 1
+                        and isinstance(declared[0], int)
+                        and not isinstance(declared[0], bool)
+                    )
+                    motor_observations.update([group] if is_vector else declared)
                 gf[new_name]["output_g"] = [
                     output for output in (gf[target].get("output_g") or gf[target].get("outpu_g") or [])
                     if output not in motor_observations and output not in required_factors

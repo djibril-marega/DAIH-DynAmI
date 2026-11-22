@@ -498,12 +498,22 @@ class GraphNavigator:
     # OBSERVATIONS
     def get_observations_by_group(self, group_name: str) -> list:
         """
-        Returns the list of observation names belonging to the specified group.
+        Returns the observation nodes belonging to a group.
+
+        A vector observation is represented by one node whose name is the
+        group name, just like a scalar observation group with one member.
         """
         return [
             node_name for node_name, properties in self.graph.items()
             if properties.get('type') == 'observation' and properties.get('group') == group_name
         ]
+
+    def get_observation_size(self, observation_name: str) -> int:
+        """Return the number of scalar values represented by one observation node."""
+        node = self.node(observation_name)
+        if node.get("type") != "observation":
+            raise TypeError(f"Node '{observation_name}' is not an observation.")
+        return int(node.get("dimension", 1))
 
 
 
@@ -525,6 +535,10 @@ def build_graph(generative_functions, observations, actions=None):
 
     Actions and observations are represented as
     individual nodes. Groups remain metadata.
+
+    Observation declarations support both formats:
+        {"position": ["x", "y"]}  # legacy scalar nodes
+        {"image": [600]}            # one vector node of dimension 600
 
     Motors are observations belonging to a group
     also declared in actions. They must be referenced
@@ -592,6 +606,7 @@ def build_graph(generative_functions, observations, actions=None):
 
     action_to_group = {}
     observation_to_group = {}
+    observation_specs = {}
 
     for group_name, action_names in actions.items():
         for action_name in action_names:
@@ -600,17 +615,50 @@ def build_graph(generative_functions, observations, actions=None):
                     f"Action '{action_name}' belongs "
                     "to multiple groups."
                 )
-
             action_to_group[action_name] = group_name
 
-    for group_name, observation_names in observations.items():
+    for group_name, declared_observations in observations.items():
+        if not isinstance(declared_observations, (list, tuple)) or not declared_observations:
+            raise TypeError(
+                f"Observations for group '{group_name}' must be a non-empty list."
+            )
+
+        # A positive integer declares one vector-valued observation node.
+        # A list of strings preserves the historical scalar-node format.
+        if (
+            len(declared_observations) == 1
+            and isinstance(declared_observations[0], int)
+            and not isinstance(declared_observations[0], bool)
+        ):
+            dimension = declared_observations[0]
+            if dimension <= 0:
+                raise ValueError(
+                    f"Vector dimension for observation '{group_name}' must be positive."
+                )
+            observation_names = [group_name]
+            observation_specs[group_name] = {
+                "names": observation_names,
+                "dimension": dimension,
+                "is_vector": True,
+            }
+        else:
+            if any(not isinstance(name, str) or not name for name in declared_observations):
+                raise TypeError(
+                    f"Observation group '{group_name}' must contain either one positive "
+                    "integer dimension or non-empty string observation names."
+                )
+            observation_names = list(declared_observations)
+            observation_specs[group_name] = {
+                "names": observation_names,
+                "dimension": None,
+                "is_vector": False,
+            }
+
         for observation_name in observation_names:
             if observation_name in observation_to_group:
                 raise ValueError(
-                    f"Observation '{observation_name}' "
-                    "belongs to multiple groups."
+                    f"Observation '{observation_name}' belongs to multiple groups."
                 )
-
             observation_to_group[observation_name] = group_name
 
     # A motor is an observation whose group also exists
@@ -620,7 +668,7 @@ def build_graph(generative_functions, observations, actions=None):
     motor_to_group = {
         motor_name: group_name
         for group_name in motor_groups
-        for motor_name in observations[group_name]
+        for motor_name in observation_specs[group_name]["names"]
     }
 
     # ---------------------------------------------------------
@@ -675,13 +723,15 @@ def build_graph(generative_functions, observations, actions=None):
     # 5. Create observation nodes
     # ---------------------------------------------------------
 
-    for group_name, observation_names in observations.items():
-        for observation_name in observation_names:
+    for group_name, spec in observation_specs.items():
+        for observation_name in spec["names"]:
             add_node(
                 observation_name,
                 "observation",
                 group=group_name,
-                is_motor=(group_name in motor_groups)
+                is_motor=(group_name in motor_groups),
+                dimension=(spec["dimension"] if spec["is_vector"] else 1),
+                is_vector=spec["is_vector"],
             )
 
     # ---------------------------------------------------------
@@ -769,7 +819,10 @@ def build_graph(generative_functions, observations, actions=None):
 
             # A motor group cannot be referenced
             # directly: motors must be referenced individually.
-            if output_name in motor_groups:
+            if (
+                output_name in motor_groups
+                and not observation_specs[output_name]["is_vector"]
+            ):
                 raise ValueError(
                     f"Motor '{output_name}' must be "
                     "referenced individually in output_g, "
@@ -811,7 +864,7 @@ def build_graph(generative_functions, observations, actions=None):
             # A group of regular observations.
             elif output_name in observations:
 
-                for observation_name in observations[output_name]:
+                for observation_name in observation_specs[output_name]["names"]:
                     add_edge(
                         state_name,
                         observation_name,

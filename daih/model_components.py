@@ -1,3 +1,4 @@
+from collections.abc import Mapping
 from torch.func import jacrev
 from . import preprocessing, utils
 import torch, math
@@ -111,15 +112,8 @@ def get_state_prediction(
 
 
 def get_actual(navigator, Q_, state, observations):
-    """
-    Retrieves actual child values in the exact order declared by output_g.
-
-    State outputs contribute every Q_[state].loc value.
-    Individual observations and observation groups contribute their observed
-    values in the order returned by the navigator.
-    """
+    """Retrieve actual child values in the exact order declared by output_g."""
     actual = []
-
     outputs_g = (
         navigator.output_g(state)
         if hasattr(navigator, "output_g")
@@ -127,7 +121,6 @@ def get_actual(navigator, Q_, state, observations):
     )
 
     for output in outputs_g:
-        # State output
         if output in Q_:
             for q in Q_[output]:
                 value = q.loc
@@ -138,17 +131,16 @@ def get_actual(navigator, Q_, state, observations):
                 actual.append(value.reshape(-1))
             continue
 
-        # Individual observation or observation group
         try:
             output_type = navigator.type(output)
         except (KeyError, TypeError, AttributeError):
             output_type = None
 
-        if output_type == "observation":
-            observation_names = [output]
-        else:
-            observation_names = navigator.get_observations_by_group(output)
-
+        observation_names = (
+            [output]
+            if output_type == "observation"
+            else navigator.get_observations_by_group(output)
+        )
         if not observation_names:
             raise KeyError(
                 f"Output '{output}' declared in output_g is neither a "
@@ -156,46 +148,51 @@ def get_actual(navigator, Q_, state, observations):
             )
 
         for observation_name in observation_names:
-            observation_key = next(
-                (
-                    key for key, variables in observations.items()
-                    if isinstance(variables, dict) and observation_name in variables
-                ),
-                None,
-            )
-            if observation_key is None:
-                raise KeyError(
-                    f"Observation '{observation_name}' is missing from "
-                    "the observations dictionary."
-                )
+            node = navigator.node(observation_name)
+            group_name = node.get("group")
+            dimension = navigator.get_observation_size(observation_name)
 
-            value = observations[observation_key][observation_name]
+            if node.get("is_vector", False):
+                if group_name not in observations:
+                    raise KeyError(
+                        f"Vector observation '{group_name}' is missing from "
+                        "the observations dictionary."
+                    )
+                value = observations[group_name]
+            else:
+                observation_group = observations.get(group_name)
+                if not isinstance(observation_group, Mapping) or observation_name not in observation_group:
+                    raise KeyError(
+                        f"Observation '{observation_name}' is missing from "
+                        "the observations dictionary."
+                    )
+                value = observation_group[observation_name]
+
             if not isinstance(value, torch.Tensor):
                 value = torch.as_tensor(value, dtype=torch.float32)
             else:
                 value = value.to(dtype=torch.float32)
-            actual.append(value.reshape(-1))
+
+            flattened = value.reshape(-1)
+            if flattened.numel() != dimension:
+                raise ValueError(
+                    f"Observation '{observation_name}' contains {flattened.numel()} "
+                    f"values, but its declared dimension is {dimension}."
+                )
+            actual.append(flattened)
 
     if not actual:
         return torch.empty(0, dtype=torch.float32)
-
     return torch.cat(actual)
 
 
 def get_actual_precision(navigator, pi_obs, Q_, state):
-    """
-    Builds precision values in output_g order.
-
-    State outputs use inverse marginal variances from Q_. Individual
-    observations and observation groups use pi_obs, defaulting to 1.
-    """
+    """Build precision values in output_g order, including vector nodes."""
     dtype = torch.float32
     device = torch.device("cpu")
     precision_values = []
 
-    outputs_g = navigator.output_g(state)
-
-    for output in outputs_g:
+    for output in navigator.output_g(state):
         if output in Q_:
             for q in Q_[output]:
                 if hasattr(q, "covariance_matrix"):
@@ -208,19 +205,12 @@ def get_actual_precision(navigator, pi_obs, Q_, state):
                         else torch.diagonal(covariance)
                     )
                 elif hasattr(q, "scale"):
-                    scale = torch.as_tensor(
-                        q.scale, dtype=dtype, device=device
-                    )
+                    scale = torch.as_tensor(q.scale, dtype=dtype, device=device)
                     variances = scale.square().reshape(-1)
                 else:
-                    raise TypeError(
-                        f"Cannot retrieve variances for '{output}'."
-                    )
-
+                    raise TypeError(f"Cannot retrieve variances for '{output}'.")
                 if torch.any(variances <= 0):
-                    raise ValueError(
-                        f"Variances for '{output}' must be positive."
-                    )
+                    raise ValueError(f"Variances for '{output}' must be positive.")
                 precision_values.append(variances.reciprocal().reshape(-1))
             continue
 
@@ -229,11 +219,11 @@ def get_actual_precision(navigator, pi_obs, Q_, state):
         except KeyError:
             output_type = None
 
-        if output_type == "observation":
-            observation_names = [output]
-        else:
-            observation_names = navigator.get_observations_by_group(output)
-
+        observation_names = (
+            [output]
+            if output_type == "observation"
+            else navigator.get_observations_by_group(output)
+        )
         if not observation_names:
             raise KeyError(
                 f"Output '{output}' is neither a state, an observation, "
@@ -241,20 +231,28 @@ def get_actual_precision(navigator, pi_obs, Q_, state):
             )
 
         for observation in observation_names:
-            precision = (
-                pi_obs.get(observation)
-                if isinstance(pi_obs, dict)
-                else None
-            )
+            dimension = navigator.get_observation_size(observation)
+            precision = pi_obs.get(observation) if isinstance(pi_obs, dict) else None
             if isinstance(precision, torch.Tensor):
                 precision = precision.to(dtype=dtype, device=device).reshape(-1)
+            elif precision is None:
+                precision = torch.ones(dimension, dtype=dtype, device=device)
             else:
-                precision = torch.ones(1, dtype=dtype, device=device)
+                precision = torch.as_tensor(
+                    precision, dtype=dtype, device=device
+                ).reshape(-1)
+
+            if precision.numel() == 1 and dimension > 1:
+                precision = precision.expand(dimension)
+            elif precision.numel() != dimension:
+                raise ValueError(
+                    f"Precision for observation '{observation}' has "
+                    f"{precision.numel()} values, expected {dimension}."
+                )
             precision_values.append(precision)
 
     if not precision_values:
         return torch.empty(0, dtype=dtype, device=device)
-
     return torch.cat(precision_values)
 
 

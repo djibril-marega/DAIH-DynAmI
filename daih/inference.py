@@ -311,12 +311,18 @@ def update_pi_obs(
                 continue
 
         for observation in observations:
-            if idx >= new_pi_actual.numel():
+            dimension = navigator.get_observation_size(observation)
+            end_idx = idx + dimension
+            if end_idx > new_pi_actual.numel():
                 raise ValueError(
                     "new_pi_actual does not contain enough precision values."
                 )
-            pi_obs[observation] = new_pi_actual[idx].clone()
-            idx += 1
+            precision = new_pi_actual[idx:end_idx].clone()
+            pi_obs[observation] = (
+                precision if dimension > 1 or navigator.node(observation).get("is_vector", False)
+                else precision[0]
+            )
+            idx = end_idx
 
     return pi_obs
 

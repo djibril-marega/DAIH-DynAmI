@@ -338,7 +338,10 @@ class Agent_DAIH:
             self.pi_obs,
             self.pi_obs_substitued,
         ) = preprocessing.handle_missing_observations(
-            observations, self.pi_obs, self.pi_obs_substitued
+            observations,
+            self.pi_obs,
+            self.pi_obs_substitued,
+            navigator=self.navigator,
         )
 
         for motors in self.beliefs_update(observations):

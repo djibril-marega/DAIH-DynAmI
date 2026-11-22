@@ -236,7 +236,7 @@ def map_outputs(output_names, output, navigator):
             name in navigator.graph
             and navigator.graph[name].get("type") == "observation"
         ):
-            output_sizes[name] = 1
+            output_sizes[name] = navigator.get_observation_size(name)
 
         else:
             # Otherwise, interpret the name as an observation group.
@@ -248,7 +248,10 @@ def map_outputs(output_names, output, navigator):
                     "nor a valid observation group."
                 )
 
-            output_sizes[name] = len(observations)
+            output_sizes[name] = sum(
+                navigator.get_observation_size(observation)
+                for observation in observations
+            )
 
     # Total number of observations expected.
     expected_size = sum(output_sizes.values())
@@ -467,9 +470,13 @@ def get_output_shape(navigator, state_name, Q_):
     # Actions do not contribute to the output shape.
     child_shapes = []
 
-    # Observational children: one column per observation.
+    # Observation nodes may represent one scalar or a complete vector.
     if observation_children:
-        child_shapes.append((1, len(observation_children)))
+        observation_width = sum(
+            navigator.get_observation_size(child["node"])
+            for child in observation_children
+        )
+        child_shapes.append((1, observation_width))
 
     # Hierarchical children: dimensions retrieved from Q_.
     for child in hierarchy_children:
@@ -531,9 +538,9 @@ def get_named_output_shapes(navigator, output_names, Q_):
     """
     Return one (rows, columns) shape per declared output name, in graph order.
 
-    A state uses the dimensions of its Q_ distributions. An individual
-    observation uses one cell, and an observation group uses one cell per
-    observation in that group.
+    A state uses the dimensions of its Q_ distributions. Scalar observation
+    nodes use one cell; vector observation nodes use their declared dimension;
+    legacy groups sum the dimensions of their member nodes.
     """
     shapes = []
 
@@ -561,7 +568,7 @@ def get_named_output_shapes(navigator, output_names, Q_):
             continue
 
         if node_type == "observation":
-            shapes.append((1, 1))
+            shapes.append((1, navigator.get_observation_size(name)))
             continue
 
         observations = navigator.get_observations_by_group(name)
@@ -570,7 +577,10 @@ def get_named_output_shapes(navigator, output_names, Q_):
                 f"Output '{name}' is neither a state, an individual "
                 "observation, nor a valid observation group."
             )
-        shapes.append((1, len(observations)))
+        shapes.append((
+            1,
+            sum(navigator.get_observation_size(observation) for observation in observations),
+        ))
 
     return tuple(shapes)
 
@@ -708,60 +718,77 @@ def prepare_world_model_inputs(
     return kwargs
 
 
-def handle_missing_observations(observations_actual, pi_obs, pi_obs_substitued, low_precision=1e-7, substitute_value=0.0):
-    """
-    Handles missing observations and restores their original precisions.
-
-    Args:
-        observations_actual (dict): Observations grouped by name.
-        pi_obs (dict): Precision of each individual observation.
-        pi_obs_substitued (dict): Backup of original precisions for
-            currently missing observations.
-        low_precision (float): Precision assigned to missing observations.
-        substitute_value (float): Numerical value replacing None.
-
-    Returns:
-        tuple:
-            - observations_actual
-            - pi_obs
-            - pi_obs_substitued
-    """
-
+def handle_missing_observations(
+    observations_actual,
+    pi_obs,
+    pi_obs_substitued,
+    low_precision=1e-7,
+    substitute_value=0.0,
+    navigator=None,
+):
+    """Handle missing scalar and vector observations and restore precisions."""
     for group, observations in observations_actual.items():
-
-        for observation, value in observations.items():
-
-            # --------------------------------------------------
-            # 1. Missing observation
-            # --------------------------------------------------
+        # New vector format: {group_name: tensor/list/None}.
+        if not isinstance(observations, Mapping):
+            observation_name = group
+            value = observations
             if value is None:
-
-                # Save the original precision only once.
-                if observation not in pi_obs_substitued:
-
-                    if observation in pi_obs:
-                        pi_obs_substitued[observation] = copy.deepcopy(
-                            pi_obs[observation]
-                        )
-
-                # Reduce its influence during inference.
-                pi_obs[observation] = torch.tensor(
-                    low_precision,
-                    dtype=torch.float32
+                original_precision = pi_obs.get(observation_name)
+                dimension = (
+                    navigator.get_observation_size(observation_name)
+                    if navigator is not None
+                    and observation_name in navigator.graph
+                    and navigator.type(observation_name) == "observation"
+                    else 1
                 )
+                if observation_name not in pi_obs_substitued:
+                    default_precision = (
+                        torch.ones(dimension, dtype=torch.float32)
+                        if dimension > 1
+                        or (
+                            navigator is not None
+                            and observation_name in navigator.graph
+                            and navigator.node(observation_name).get("is_vector", False)
+                        )
+                        else torch.tensor(1.0, dtype=torch.float32)
+                    )
+                    pi_obs_substitued[observation_name] = copy.deepcopy(
+                        original_precision if original_precision is not None else default_precision
+                    )
 
-                # Replace None with a numerical value.
+                if isinstance(original_precision, torch.Tensor) and original_precision.numel() > 1:
+                    pi_obs[observation_name] = torch.full_like(
+                        original_precision, low_precision
+                    )
+                    dimension = original_precision.numel()
+                else:
+                    pi_obs[observation_name] = torch.tensor(
+                        low_precision, dtype=torch.float32
+                    )
+
+                observations_actual[group] = (
+                    torch.full((dimension,), substitute_value, dtype=torch.float32)
+                    if dimension > 1 or (
+                        navigator is not None
+                        and observation_name in navigator.graph
+                        and navigator.node(observation_name).get("is_vector", False)
+                    )
+                    else substitute_value
+                )
+            elif observation_name in pi_obs_substitued:
+                pi_obs[observation_name] = pi_obs_substitued.pop(observation_name)
+            continue
+
+        # Historical format: {group_name: {scalar_name: value}}.
+        for observation, value in observations.items():
+            if value is None:
+                if observation not in pi_obs_substitued:
+                    if observation in pi_obs:
+                        pi_obs_substitued[observation] = copy.deepcopy(pi_obs[observation])
+                pi_obs[observation] = torch.tensor(low_precision, dtype=torch.float32)
                 observations[observation] = substitute_value
-
-            # --------------------------------------------------
-            # 2. Observation available again
-            # --------------------------------------------------
             elif observation in pi_obs_substitued:
-
-                # Restore the original precision if it was saved.
                 pi_obs[observation] = pi_obs_substitued.pop(observation)
 
     return observations_actual, pi_obs, pi_obs_substitued
-
-
 

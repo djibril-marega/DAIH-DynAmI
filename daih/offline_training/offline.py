@@ -486,7 +486,10 @@ class _LegacyOfflineTrainer:
                 if allowed_states is not None:
                     self._observation_compatibility[id(prepared)] = set(allowed_states)
                 prepared, pi_obs, pi_substituted = preprocessing.handle_missing_observations(
-                    prepared, deepcopy(self.agent.pi_obs), deepcopy(self.agent.pi_obs_substitued)
+                    prepared,
+                    deepcopy(self.agent.pi_obs),
+                    deepcopy(self.agent.pi_obs_substitued),
+                    navigator=self.agent.navigator,
                 )
                 self.agent.pi_obs = pi_obs
                 self.agent.pi_obs_substitued = pi_substituted
@@ -515,6 +518,7 @@ class _LegacyOfflineTrainer:
                         prepared,
                         self.agent.pi_obs,
                         self.agent.pi_obs_substitued,
+                        navigator=self.agent.navigator,
                     )
                 )
 
@@ -862,20 +866,32 @@ class _LegacyOfflineTrainer:
             key: (value.detach().clone() if torch.is_tensor(value) else deepcopy(value))
             for key, value in self.agent.inputs_map.items()
         }
-        for group_values in observations.values():
-            if not isinstance(group_values, dict):
+        for group_name, group_values in observations.items():
+            if isinstance(group_values, dict):
+                for factor_name, raw_value in group_values.items():
+                    reference = inputs.get(factor_name)
+                    if torch.is_tensor(reference):
+                        value = torch.as_tensor(
+                            raw_value, device=reference.device, dtype=reference.dtype
+                        )
+                        if value.numel() == reference.numel():
+                            value = value.reshape_as(reference)
+                    else:
+                        value = torch.as_tensor(raw_value, dtype=torch.float32)
+                    inputs[factor_name] = value
                 continue
-            for factor_name, raw_value in group_values.items():
-                reference = inputs.get(factor_name)
-                if torch.is_tensor(reference):
-                    value = torch.as_tensor(
-                        raw_value, device=reference.device, dtype=reference.dtype
-                    )
-                    if value.numel() == reference.numel():
-                        value = value.reshape_as(reference)
-                else:
-                    value = torch.as_tensor(raw_value, dtype=torch.float32)
-                inputs[factor_name] = value
+
+            # A vector observation is supplied directly under its group name.
+            reference = inputs.get(group_name)
+            if torch.is_tensor(reference):
+                value = torch.as_tensor(
+                    group_values, device=reference.device, dtype=reference.dtype
+                )
+                if value.numel() == reference.numel():
+                    value = value.reshape_as(reference)
+            else:
+                value = torch.as_tensor(group_values, dtype=torch.float32)
+            inputs[group_name] = value
         return inputs
 
     def _optimize_policy(self, observations: dict):
