@@ -36,6 +36,9 @@ class OfflineConfig:
     learning_rate: float = 1e-3
     weight_decay: float = 1e-5
     gradient_clip: float = 5.0
+    # Maximum number of historical observations passed through f/g in one
+    # native model batch. Gradients accumulate across chunks before one step.
+    model_batch_size: int = 64
     belief_gradient_clip: float = 100.0
     dt: float = 0.1
     patience: int = 4
@@ -181,6 +184,8 @@ class _LegacyOfflineTrainer:
         self.best_checkpoint_path: str | None = None
 
     def _validate_config(self) -> None:
+        if int(self.config.model_batch_size) < 1:
+            raise ValueError("model_batch_size must be >= 1.")
         if self.config.checkpoint_every < 1:
             raise ValueError("checkpoint_every must be >= 1.")
         if self.config.detection_mode != "current":
@@ -598,6 +603,195 @@ class _LegacyOfflineTrainer:
         )
         return prepared, posterior, F_value
 
+    def _supports_native_batch(self, state_name: str) -> bool:
+        """Return whether this state's f/g path is backed by batch-aware WorldModels.
+
+        User-registered local callables are deliberately excluded unless they
+        explicitly advertise ``supports_batch = True``. This avoids silently
+        changing the semantics of legacy scalar callables.
+        """
+        from ..world_model import WorldModel
+
+        relevant = [state_name]
+        relevant.extend(self.agent.navigator.parent_nodes(state_name, node_type="state"))
+        for name in relevant:
+            for kind in ("f", "g"):
+                ref = self.agent.navigator.function(name, kind)
+                if ref is None:
+                    continue
+                module = (self.agent.functions_map or {}).get(ref)
+                if isinstance(module, WorldModel):
+                    state_id = self.agent.states_list.index(name) + 1
+                    layer_id = self.agent.navigator.get_state_layer(name)
+                    if module.has_local_function(state_id, layer_id, kind):
+                        local_key = (state_id, layer_id, kind)
+                        local_fn = module._local_functions.get(local_key)
+                        if local_fn is None:
+                            module_key = module._local_module_keys.get(local_key)
+                            local_fn = module._local_modules.get(module_key)
+                        if not bool(getattr(local_fn, "supports_batch", False)):
+                            return False
+                elif not bool(getattr(module, "supports_batch", False)):
+                    return False
+        return True
+
+    def _prepare_state_objectives_batch(self, state_name: str, entries):
+        """Prepare a time batch with native batched f/g model calls.
+
+        Each entry contains its own post-inference belief snapshot. The snapshots
+        were produced in chronological order by _build_belief_contexts; batching
+        here only combines independent numerical model evaluations after those
+        sequential belief updates have completed.
+        """
+        frames = [frame for _, frame, _ in entries]
+        contexts = [context for _, _, context in entries]
+        batch_size = len(entries)
+        batched_inputs = preprocessing.stack_inputs_maps(
+            [context["inputs_map"] for context in contexts]
+        )
+        if batched_inputs is None:
+            raise ValueError("Observation contexts do not have stack-compatible model inputs.")
+
+        first_Q = contexts[0]["Q_"]
+        state_prior = model_components.get_parent_g_predictions_batch(
+            self.agent.navigator, self.agent.functions_map, batched_inputs,
+            state_name, self.agent.states_list, first_Q, batch_size,
+        )
+        f_transition = model_components.get_transition_prediction_batch(
+            self.agent.navigator, self.agent.functions_map, batched_inputs,
+            state_name, self.agent.states_list, first_Q,
+            state_min=self.agent.min_state_value,
+            state_max=self.agent.max_state_value, batch_size=batch_size,
+        ).unsqueeze(1)
+        prediction = model_components.get_state_prediction_batch(
+            self.agent.navigator, self.agent.functions_map, batched_inputs,
+            state_name, self.agent.states_list, first_Q,
+            state_min=self.agent.min_state_value,
+            state_max=self.agent.max_state_value,
+            observation_bounds=self.agent.observation_bounds,
+            batch_size=batch_size,
+        )
+
+        state_posteriors = []
+        pi_priors = []
+        actuals = []
+        pi_observations = []
+        for frame, context in zip(frames, contexts):
+            state_posteriors.append(
+                context["inputs_map"][state_name].reshape(1, -1)
+            )
+            pi_priors.append(model_components.get_parent_g_precisions(
+                self.agent.navigator, state_name, context["pi_priors"], context["Q_"]
+            ))
+            actuals.append(model_components.get_actual(
+                self.agent.navigator, context["Q_"], state_name, frame
+            ))
+            pi_observations.append(model_components.get_actual_precision(
+                self.agent.navigator, context["pi_obs"], context["Q_"], state_name
+            ))
+
+        state_posterior = torch.stack(state_posteriors, dim=0)
+        pi_prior = torch.stack(pi_priors, dim=0)
+        actual = torch.stack(actuals, dim=0)
+        pi_obs = torch.stack(pi_observations, dim=0)
+
+        if state_prior.shape[1] == 0:
+            state_prior = torch.zeros_like(state_posterior)
+            pi_prior = torch.full_like(state_posterior, fill_value=1e-7)
+
+        # Match the original scalar objective's precision floor and autograd
+        # boundaries exactly, while preserving each frame as a separate item.
+        posterior = state_posterior.detach().clone().requires_grad_(True)
+        pi_prior = pi_prior.detach().clone().requires_grad_(True)
+        pi_obs = pi_obs.clamp_min(self.config.min_precision)
+        gamma_obs = torch.log(pi_obs).detach().requires_grad_(True)
+        if not prediction.requires_grad:
+            prediction = prediction.detach().requires_grad_(True)
+
+        objective_inputs = []
+        for index in range(batch_size):
+            objective_inputs.append((
+                state_prior[index], posterior[index], f_transition[index],
+                pi_prior[index], actual[index], pi_obs[index],
+                gamma_obs[index], prediction[index],
+            ))
+        return objective_inputs
+
+    def _measure_objective_inputs(
+        self, state_name: str, objective_inputs: tuple[torch.Tensor, ...],
+        metric_pi_obs: torch.Tensor | None = None,
+    ) -> tuple[StateMetrics, torch.Tensor]:
+        (state_prior, posterior, f_transition, pi_prior, actual,
+         pi_obs, gamma_obs, prediction) = objective_inputs
+        F_value = self.agent.free_energy(
+            state_prior, posterior, f_transition, pi_prior,
+            actual, pi_obs, gamma_obs, prediction,
+        )
+
+        gradient = torch.autograd.grad(
+            F_value, posterior, retain_graph=True, create_graph=True,
+            allow_unused=True,
+        )[0]
+        if gradient is None:
+            gradient_tensor = torch.zeros_like(posterior.detach()).reshape(-1)
+            gradient_finite = True
+        else:
+            gradient_tensor = gradient.detach().reshape(-1)
+            gradient_finite = bool(torch.isfinite(gradient_tensor).all().item())
+
+        gradient_raw = (
+            [float(value) for value in gradient_tensor.cpu().tolist()]
+            if gradient_finite else []
+        )
+        gradient_sum = (
+            finite_float(gradient_tensor.abs().sum().item())
+            if gradient_finite else 0.0
+        )
+        gradient_norm = (
+            finite_float(torch.linalg.vector_norm(gradient_tensor).item())
+            if gradient_finite else 0.0
+        )
+
+        hessian_norm = 0.0
+        hessian_finite = False
+        try:
+            hessian = inference.second_derivative_F(posterior, F_value).detach()
+            hessian_norm = finite_float(torch.linalg.vector_norm(hessian).item())
+            hessian_finite = bool(torch.isfinite(hessian).all().item())
+            eigenvalues = torch.linalg.eigvalsh(
+                0.5 * (hessian + hessian.transpose(-1, -2))
+            )
+            precision = finite_float(eigenvalues.clamp_min(0).mean().item())
+        except (RuntimeError, ValueError):
+            precision = 0.0
+
+        complexity = finite_float(
+            (0.5 * pi_prior.detach() *
+             (posterior.detach() + f_transition.detach()
+              - state_prior.detach()).square()).sum().item()
+        )
+        accuracy_precision = pi_obs if metric_pi_obs is None else metric_pi_obs
+        accuracy = finite_float(
+            (-0.5 * accuracy_precision.detach() *
+             (actual.detach() - prediction.detach()).square()).sum().item()
+        )
+        metric = StateMetrics(
+            state=state_name,
+            free_energy=finite_float(F_value.detach().item()),
+            gradient_norm=gradient_norm,
+            gradient_raw=gradient_raw,
+            gradient_sum=gradient_sum,
+            gradient_finite=gradient_finite,
+            precision=precision,
+            complexity=complexity,
+            accuracy=accuracy,
+            local_sensitivity=0.0,
+            hessian_norm=hessian_norm,
+            local_sensitivity_finite=False,
+            hessian_finite=hessian_finite,
+        )
+        return metric, F_value
+
     def _measure_state(self, state_name: str, observations: dict) -> tuple[StateMetrics, torch.Tensor]:
         prepared, posterior, F_value = self._state_objective(state_name, observations)
 
@@ -612,8 +806,6 @@ class _LegacyOfflineTrainer:
             gradient_tensor = gradient.detach().reshape(-1)
             gradient_finite = bool(torch.isfinite(gradient_tensor).all().item())
 
-        # Keep the actual components: reducing them to a norm loses the
-        # coordinate-wise signal needed by structural decisions.
         gradient_raw = (
             [float(value) for value in gradient_tensor.cpu().tolist()]
             if gradient_finite else []
@@ -622,7 +814,6 @@ class _LegacyOfflineTrainer:
             finite_float(gradient_tensor.abs().sum().item())
             if gradient_finite else 0.0
         )
-        # Retained only as a backward-compatible diagnostic.
         gradient_norm = (
             finite_float(torch.linalg.vector_norm(gradient_tensor).item())
             if gradient_finite else 0.0
@@ -634,9 +825,9 @@ class _LegacyOfflineTrainer:
             hessian = inference.second_derivative_F(posterior, F_value).detach()
             hessian_norm = finite_float(torch.linalg.vector_norm(hessian).item())
             hessian_finite = bool(torch.isfinite(hessian).all().item())
-            # Precision is the non-negative mean curvature, not the raw
-            # signed trace (which could classify a saddle as high precision).
-            eigenvalues = torch.linalg.eigvalsh(0.5 * (hessian + hessian.transpose(-1, -2)))
+            eigenvalues = torch.linalg.eigvalsh(
+                0.5 * (hessian + hessian.transpose(-1, -2))
+            )
             precision = finite_float(eigenvalues.clamp_min(0).mean().item())
         except (RuntimeError, ValueError):
             precision = 0.0
@@ -650,7 +841,6 @@ class _LegacyOfflineTrainer:
             (-0.5 * prepared["pi_obs"].detach() *
              (prepared["actual"].detach() - prepared["prediction"].detach()).square()).sum().item()
         )
-        local_sensitivity, local_sensitivity_finite = 0.0, False
         metric = StateMetrics(
             state=state_name,
             free_energy=finite_float(F_value.detach().item()),
@@ -661,9 +851,9 @@ class _LegacyOfflineTrainer:
             precision=precision,
             complexity=complexity,
             accuracy=accuracy,
-            local_sensitivity=local_sensitivity,
+            local_sensitivity=0.0,
             hessian_norm=hessian_norm,
-            local_sensitivity_finite=local_sensitivity_finite,
+            local_sensitivity_finite=False,
             hessian_finite=hessian_finite,
         )
         return metric, F_value
@@ -812,46 +1002,71 @@ class _LegacyOfflineTrainer:
         ]
         batches = observations if (isinstance(observations, list) and observations and isinstance(observations[0], tuple)) else [(observations, self._snapshot_beliefs())]
 
-        # First prepare frames in the original frame-major/state-major order.
-        # Belief contexts are installed one at a time and never vmapped: in
-        # temporal mode they encode a recurrence across observations.
-        prepared_by_state: dict[str, list[tuple[int, tuple[torch.Tensor, ...]]]] = {
-            name: [] for name in state_names
-        }
-        for frame_index, (frame, belief_context) in enumerate(batches):
-            allowed_states = self._allowed_states_for_frame(frame)
-            with self._using_beliefs(belief_context):
-                for state_name in state_names:
-                    if allowed_states is not None and state_name not in allowed_states:
-                        continue
-                    prepared = self._prepared_state(state_name, frame)
-                    prepared_by_state[state_name].append((
-                        frame_index,
-                        self._objective_inputs_from_prepared(prepared),
-                    ))
+        # Preserve chronological belief inference, then batch compatible
+        # model evaluations. Chunks limit activation memory; backward is
+        # accumulated across chunks and the optimizer still steps exactly once.
+        vectorized_state_count = 0
+        vectorized_frame_count = 0
+        total_loss_value = 0.0
+        has_gradient_loss = False
+        chunk_size = max(1, int(self.config.model_batch_size))
 
-        # Vectorize only the pure free-energy calculation. Store results by
-        # original frame/state order so summation and compatibility semantics
-        # remain the same as before batching.
-        frame_losses: list[list[torch.Tensor]] = [[] for _ in batches]
         for state_name in state_names:
-            entries = prepared_by_state[state_name]
+            entries = []
+            for frame_index, (frame, belief_context) in enumerate(batches):
+                allowed_states = self._allowed_states_for_frame(frame)
+                if allowed_states is None or state_name in allowed_states:
+                    entries.append((frame_index, frame, belief_context))
             if not entries:
                 continue
-            values = self._free_energy_batch([items for _, items in entries])
-            for (frame_index, _), value in zip(entries, values):
-                if value.requires_grad and bool(torch.isfinite(value).detach().item()):
-                    frame_losses[frame_index].append(value / max(1, len(batches)))
 
-        losses = [loss for frame_items in frame_losses for loss in frame_items]
-        if not losses:
-            return {"updated": False, "loss": None, "parameters": 0}
+            for start in range(0, len(entries), chunk_size):
+                chunk = entries[start:start + chunk_size]
+                objective_inputs = None
+                if len(chunk) >= 2 and self._supports_native_batch(state_name):
+                    try:
+                        objective_inputs = self._prepare_state_objectives_batch(
+                            state_name, chunk
+                        )
+                        vectorized_state_count += 1
+                        vectorized_frame_count += len(chunk)
+                    except (RuntimeError, TypeError, ValueError, KeyError, IndexError,
+                            AttributeError, NotImplementedError):
+                        # A legacy local callable or heterogeneous input shape
+                        # falls back to the scalar path for this chunk only.
+                        objective_inputs = None
 
-        total_loss = torch.stack([loss.reshape(()) for loss in losses]).sum()
-        if not total_loss.requires_grad:
-            return {"updated": False, "loss": finite_float(total_loss.item()), "parameters": 0}
+                if objective_inputs is None:
+                    objective_inputs = []
+                    for _, frame, belief_context in chunk:
+                        with self._using_beliefs(belief_context):
+                            prepared = self._prepared_state(state_name, frame)
+                        objective_inputs.append(
+                            self._objective_inputs_from_prepared(prepared)
+                        )
 
-        total_loss.backward()
+                values = self._free_energy_batch(objective_inputs)
+                finite_losses = [
+                    value.reshape(()) / max(1, len(batches))
+                    for value in values
+                    if value.requires_grad and bool(torch.isfinite(value).detach().item())
+                ]
+                if finite_losses:
+                    chunk_loss = torch.stack(finite_losses).sum()
+                    total_loss_value += float(chunk_loss.detach().item())
+                    if chunk_loss.requires_grad:
+                        chunk_loss.backward()
+                        has_gradient_loss = True
+
+        if not has_gradient_loss:
+            return {
+                "updated": False,
+                "loss": finite_float(total_loss_value) if total_loss_value else None,
+                "parameters": 0,
+                "vectorized_states": vectorized_state_count,
+                "vectorized_frames": vectorized_frame_count,
+            }
+
         parameters = [
             parameter
             for group in groups
@@ -864,10 +1079,10 @@ class _LegacyOfflineTrainer:
 
         return {
             "updated": bool(parameters),
-            "loss": finite_float(total_loss.detach().item()),
+            "loss": finite_float(total_loss_value),
             "parameters": sum(parameter.numel() for parameter in parameters),
-            "vectorized_states": sum(bool(items) for items in prepared_by_state.values()),
-            "vectorized_frames": sum(len(items) for items in prepared_by_state.values()),
+            "vectorized_states": vectorized_state_count,
+            "vectorized_frames": vectorized_frame_count,
         }
 
     def _policy_candidate_posterior(self, policy_output, base_inputs=None):
@@ -1084,16 +1299,56 @@ class _LegacyOfflineTrainer:
     def _evaluate(self, observations) -> tuple[float, dict[str, StateMetrics]]:
         batches = observations if (isinstance(observations, list) and observations and isinstance(observations[0], tuple)) else [(observations, self._snapshot_beliefs())]
         collected: dict[str, list[StateMetrics]] = defaultdict(list)
-        for frame, belief_context in batches:
-            allowed_states = self._allowed_states_for_frame(frame)
-            with self._using_beliefs(belief_context):
-                for state_name, node in self.agent.navigator.graph.items():
-                    if node.get("type") != "state":
-                        continue
-                    if allowed_states is not None and state_name not in allowed_states:
-                        continue
-                    metric, _ = self._measure_state(state_name, frame)
-                    collected[state_name].append(metric)
+        state_names = [
+            name for name, node in self.agent.navigator.graph.items()
+            if node.get("type") == "state"
+        ]
+
+        # As in optimization, all belief snapshots are already computed in
+        # chronological order. Evaluation batches only the pure f/g forwards;
+        # gradients and curvature diagnostics remain per observation.
+        for state_name in state_names:
+            entries = []
+            for frame, belief_context in batches:
+                allowed_states = self._allowed_states_for_frame(frame)
+                if allowed_states is None or state_name in allowed_states:
+                    entries.append((frame, belief_context))
+            if not entries:
+                continue
+
+            chunk_size = max(1, int(self.config.model_batch_size))
+            for start in range(0, len(entries), chunk_size):
+                chunk = entries[start:start + chunk_size]
+                objective_inputs = None
+                if len(chunk) >= 2 and self._supports_native_batch(state_name):
+                    try:
+                        indexed_entries = [
+                            (index, frame, context)
+                            for index, (frame, context) in enumerate(chunk)
+                        ]
+                        objective_inputs = self._prepare_state_objectives_batch(
+                            state_name, indexed_entries
+                        )
+                    except (RuntimeError, TypeError, ValueError, KeyError, IndexError,
+                            AttributeError, NotImplementedError):
+                        objective_inputs = None
+
+                if objective_inputs is not None:
+                    for items, (_, context) in zip(objective_inputs, chunk):
+                        raw_pi_obs = model_components.get_actual_precision(
+                            self.agent.navigator, context["pi_obs"],
+                            context["Q_"], state_name,
+                        )
+                        metric, _ = self._measure_objective_inputs(
+                            state_name, items, metric_pi_obs=raw_pi_obs
+                        )
+                        collected[state_name].append(metric)
+                else:
+                    for frame, belief_context in chunk:
+                        with self._using_beliefs(belief_context):
+                            metric, _ = self._measure_state(state_name, frame)
+                        collected[state_name].append(metric)
+
         metrics = {}
         for state_name, items in collected.items():
             n = len(items)

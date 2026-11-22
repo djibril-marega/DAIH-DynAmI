@@ -44,8 +44,11 @@ class WorldModel(nn.Module):
 
     Matrix inputs can have any spatial size
     (2D [R,C] or 3D batch [B,R,C]). Within the same batch, matrices must
-    naturally have the same shape.
+    naturally have the same shape. The global f/g/V paths accept native
+    batches; local callables must advertise ``supports_batch = True`` before
+    the offline trainer will send them batched inputs.
     """
+    supports_batch = True
     VALID_TYPES = ("f", "g", "p", "V")
 
     def __init__(
@@ -303,6 +306,23 @@ class WorldModel(nn.Module):
             layer_ids = layer_ids.expand(batch)
         if state_ids.numel() != batch or layer_ids.numel() != batch:
             raise ValueError("state_id and layer_id must be scalars or have one value per batch item.")
+
+        # Historical batches normally share one state/layer pair. Apply its
+        # local context blocks to the whole batch in one module call rather
+        # than dispatching once per observation. Mixed IDs retain the grouped
+        # fallback below.
+        if bool(torch.all(state_ids == state_ids[0])) and bool(
+            torch.all(layer_ids == layer_ids[0])
+        ):
+            key = self._local_context_key(
+                int(state_ids[0].item()), int(layer_ids[0].item())
+            )
+            if key not in self.local_context_blocks:
+                return context
+            value = context
+            for block in self.local_context_blocks[key]:
+                value = value + block(value)
+            return value
 
         rows = []
         for index in range(batch):

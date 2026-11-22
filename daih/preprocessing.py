@@ -52,6 +52,65 @@ def preprocessing_layer_for_free_energy(
     }
 
 
+
+def stack_inputs_maps(inputs_maps):
+    """Stack compatible per-observation input maps into a native batch.
+
+    Values that are tensors (or tensor-convertible numerics) are stacked on a
+    new leading time/batch axis. Constant non-numeric metadata is retained.
+    Returns None when maps cannot be represented by one rectangular batch.
+    """
+    if not inputs_maps:
+        return None
+    keys = set(inputs_maps[0])
+    if any(set(item) != keys for item in inputs_maps[1:]):
+        return None
+
+    batched = {}
+    for key in keys:
+        values = [item[key] for item in inputs_maps]
+        if all(torch.is_tensor(value) for value in values):
+            if any(tuple(value.shape) != tuple(values[0].shape) for value in values[1:]):
+                return None
+            try:
+                batched[key] = torch.stack(values, dim=0)
+            except (RuntimeError, TypeError):
+                return None
+            continue
+
+        # Numeric scalars/lists can be batched as well. Keep immutable
+        # metadata unchanged only when it is identical for every frame.
+        try:
+            tensors = [torch.as_tensor(value) for value in values]
+            if any(tuple(value.shape) != tuple(tensors[0].shape) for value in tensors[1:]):
+                return None
+            batched[key] = torch.stack(tensors, dim=0)
+        except (TypeError, ValueError, RuntimeError):
+            if not all(value == values[0] for value in values[1:]):
+                return None
+            batched[key] = values[0]
+    return batched
+
+
+def flatten_named_outputs_batch(named_outputs, batch_size):
+    """Flatten named outputs while preserving their leading batch dimension."""
+    if not named_outputs:
+        return torch.empty((batch_size, 0), dtype=torch.float32)
+    parts = []
+    for value in named_outputs.values():
+        tensor = value if torch.is_tensor(value) else torch.as_tensor(value, dtype=torch.float32)
+        if tensor.ndim == 0:
+            if batch_size != 1:
+                raise ValueError("A scalar output cannot represent multiple batch items.")
+            tensor = tensor.reshape(1, 1)
+        elif tensor.shape[0] != batch_size:
+            raise ValueError(
+                f"Batched output must have leading dimension {batch_size}; "
+                f"received shape {tuple(tensor.shape)}."
+            )
+        parts.append(tensor.reshape(batch_size, -1))
+    return torch.cat(parts, dim=1) if len(parts) > 1 else parts[0]
+
 def sync_state_inputs(D, Q_, inputs_map=None):
     """
     Synchronize the inputs corresponding to states with Q[i].loc.

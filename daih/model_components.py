@@ -536,6 +536,105 @@ def get_parent_g_predictions(
     return torch.stack(predictions, dim=0)
 
 
+
+def get_state_prediction_batch(
+    navigator, functions_map, inputs_map, state, states_list, Q_, *,
+    state_min, state_max, observation_bounds, batch_size,
+):
+    """Execute one state's g model once for a batch of independent frames."""
+    if navigator.function(state, "g") is None:
+        raise ValueError(f"No g function is defined for state '{state}'.")
+    named_outputs = preprocessing.execute_named_function(
+        navigator, functions_map, inputs_map, state, "g", states_list, "g", Q_
+    )
+    bounded = {}
+    for output_name, output in named_outputs.items():
+        node = navigator.graph.get(output_name)
+        output_type = node.get("type") if node is not None else None
+        if output_type == "state":
+            value = utils.smooth_bound(output, state_min, state_max)
+        elif output_type == "observation":
+            group = node.get("group")
+            if group not in observation_bounds:
+                raise KeyError(f"Missing observation bounds for group '{group}'.")
+            bounds = observation_bounds[group]
+            value = utils.smooth_bound(output, bounds["min"], bounds["max"])
+        else:
+            group = output_name
+            if not navigator.get_observations_by_group(group):
+                raise ValueError(
+                    f"Output '{output_name}' of g for state '{state}' is not a known state or observation group."
+                )
+            if group not in observation_bounds:
+                raise KeyError(f"Missing observation bounds for group '{group}'.")
+            bounds = observation_bounds[group]
+            value = utils.smooth_bound(output, bounds["min"], bounds["max"])
+        bounded[output_name] = value
+    return preprocessing.flatten_named_outputs_batch(bounded, batch_size)
+
+
+def get_transition_prediction_batch(
+    navigator, functions_map, inputs_map, state, states_list, Q_, *,
+    state_min, state_max, batch_size,
+):
+    """Execute one state's f model once for a batch of adjacent transitions."""
+    if navigator.function(state, "f") is None:
+        return torch.empty((batch_size, 0), dtype=torch.float32)
+    named_outputs = preprocessing.execute_named_function(
+        navigator, functions_map, inputs_map, state, "f", states_list, "f", Q_
+    )
+    if not named_outputs:
+        raise ValueError(f"Function f for state '{state}' returned no declared outputs.")
+    prediction = next(iter(named_outputs.values()))
+    prediction = utils.smooth_bound(prediction, state_min, state_max)
+    return preprocessing.flatten_named_outputs_batch(
+        {"prediction": prediction}, batch_size
+    )
+
+
+def get_parent_g_predictions_batch(
+    navigator, functions_map, inputs_map, state, states_list, Q_, batch_size
+):
+    """Batch parent g predictions; result shape is [B, parents, state_features]."""
+    if state not in Q_ or not Q_[state]:
+        raise KeyError(f"State '{state}' is missing from Q_ or has no distributions.")
+    expected_shape = preprocessing.get_named_output_shapes(navigator, [state], Q_)[0]
+    expected_numel = math.prod(expected_shape)
+    reference = Q_[state][0].loc
+    if not torch.is_tensor(reference):
+        reference = torch.as_tensor(reference, dtype=torch.float32)
+    dtype = reference.dtype if reference.is_floating_point() else torch.float32
+    device = reference.device
+    predictions = []
+    for parent in navigator.parent_nodes(state, node_type="state"):
+        if navigator.function(parent, "g") is None:
+            continue
+        if state not in preprocessing.get_io_names(navigator, parent, "g", "output"):
+            continue
+        outputs = preprocessing.execute_named_function(
+            navigator, functions_map, inputs_map, parent, "g", states_list, "g", Q_
+        )
+        if state not in outputs:
+            raise KeyError(
+                f"Parent '{parent}' declares '{state}' but its batch execution omitted that output."
+            )
+        prediction = outputs[state]
+        if not torch.is_tensor(prediction):
+            prediction = torch.as_tensor(prediction, dtype=dtype, device=device)
+        if prediction.ndim < 2 or prediction.shape[0] != batch_size:
+            raise ValueError(
+                f"Parent '{parent}' returned a non-batched output with shape {tuple(prediction.shape)}."
+            )
+        if tuple(prediction.shape[1:]) != expected_shape:
+            raise ValueError(
+                f"Parent '{parent}' batch prediction has shape {tuple(prediction.shape[1:])}; "
+                f"expected {expected_shape}."
+            )
+        predictions.append(prediction.to(device=device, dtype=dtype).reshape(batch_size, -1))
+    if not predictions:
+        return torch.empty((batch_size, 0, expected_numel), dtype=dtype, device=device)
+    return torch.stack(predictions, dim=1)
+
 def get_parent_g_precisions(navigator, state, pi_priors, Q_):
     """Collect precision tensors for each parent g prediction of ``state``.
 

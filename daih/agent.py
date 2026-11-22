@@ -151,56 +151,32 @@ class Agent_DAIH:
         if navigator is not None:
             self.navigator = navigator
 
-        # Initialize observation precisions for every observation node.
-        # Scalar observations use a scalar tensor (0-D).
-        # Vector observations use a tensor with one precision per component.
+        # A vector observation remains one graph node, while pi_obs stores
+        # one independently updated precision per vector component.
         for observation_name, node in self.navigator.graph.items():
-            if node.get("type") != "observation":
+            if node.get("type") != "observation" or not node.get("is_vector", False):
                 continue
-
+            dimension = self.navigator.get_observation_size(observation_name)
             existing = self.pi_obs.get(observation_name)
-
-            if node.get("is_vector", False):
-                dimension = self.navigator.get_observation_size(
-                    observation_name
+            if existing is None:
+                self.pi_obs[observation_name] = torch.ones(
+                    dimension, dtype=torch.float32
                 )
-
-                if existing is None:
-                    precision = torch.ones(
-                        dimension, dtype=torch.float32
-                    )
-                else:
-                    precision = torch.as_tensor(
-                        existing, dtype=torch.float32
-                    ).reshape(-1)
-
-                    if precision.numel() == 1:
-                        precision = precision.expand(dimension).clone()
-                    elif precision.numel() != dimension:
-                        raise ValueError(
-                            f"Observation precision for '{observation_name}' "
-                            f"has {precision.numel()} values; "
-                            f"expected {dimension}."
-                        )
-
             else:
-                if existing is None:
-                    precision = torch.tensor(1.0, dtype=torch.float32)
-                else:
-                    precision = torch.as_tensor(
-                        existing, dtype=torch.float32
-                    ).reshape(())
-
-            if (
-                not torch.isfinite(precision).all()
-                or (precision <= 0).any()
-            ):
-                raise ValueError(
-                    f"Observation precision for '{observation_name}' "
-                    "must be finite and strictly positive."
-                )
-
-            self.pi_obs[observation_name] = precision
+                precision = torch.as_tensor(existing, dtype=torch.float32).reshape(-1)
+                if precision.numel() == 1:
+                    precision = precision.expand(dimension).clone()
+                elif precision.numel() != dimension:
+                    raise ValueError(
+                        f"Observation precision for '{observation_name}' has "
+                        f"{precision.numel()} values; expected {dimension}."
+                    )
+                if not torch.isfinite(precision).all() or (precision <= 0).any():
+                    raise ValueError(
+                        f"Observation precision for '{observation_name}' must be "
+                        "finite and strictly positive."
+                    )
+                self.pi_obs[observation_name] = precision
 
         self.pi_priors = model.init_relation_priors(self.navigator, self.pi_states)
         self.inputs_map = preprocessing.sync_state_inputs(
