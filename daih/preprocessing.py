@@ -734,6 +734,12 @@ def handle_missing_observations(
             value = observations
             if value is None:
                 original_precision = pi_obs.get(observation_name)
+                is_vector = (
+                    navigator is not None
+                    and observation_name in navigator.graph
+                    and navigator.type(observation_name) == "observation"
+                    and navigator.node(observation_name).get("is_vector", False)
+                )
                 dimension = (
                     navigator.get_observation_size(observation_name)
                     if navigator is not None
@@ -744,23 +750,21 @@ def handle_missing_observations(
                 if observation_name not in pi_obs_substitued:
                     default_precision = (
                         torch.ones(dimension, dtype=torch.float32)
-                        if dimension > 1
-                        or (
-                            navigator is not None
-                            and observation_name in navigator.graph
-                            and navigator.node(observation_name).get("is_vector", False)
-                        )
+                        if dimension > 1 or is_vector
                         else torch.tensor(1.0, dtype=torch.float32)
                     )
                     pi_obs_substitued[observation_name] = copy.deepcopy(
                         original_precision if original_precision is not None else default_precision
                     )
 
-                if isinstance(original_precision, torch.Tensor) and original_precision.numel() > 1:
+                if is_vector:
+                    pi_obs[observation_name] = torch.full(
+                        (dimension,), low_precision, dtype=torch.float32
+                    )
+                elif isinstance(original_precision, torch.Tensor) and original_precision.numel() > 1:
                     pi_obs[observation_name] = torch.full_like(
                         original_precision, low_precision
                     )
-                    dimension = original_precision.numel()
                 else:
                     pi_obs[observation_name] = torch.tensor(
                         low_precision, dtype=torch.float32
