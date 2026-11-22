@@ -715,6 +715,70 @@ class _LegacyOfflineTrainer:
         """None means all current states; a set is a per-observation compatibility mask."""
         return self._observation_compatibility.get(id(frame))
 
+    def _objective_inputs_from_prepared(self, prepared: dict) -> tuple[torch.Tensor, ...]:
+        """Build the exact tensor arguments used by ``_state_objective``.
+
+        Keeping this preparation outside ``vmap`` is deliberate: graph lookup,
+        observation decoding, and per-frame belief contexts are Python/stateful
+        operations. The resulting numerical free-energy calculation is pure and
+        can safely be mapped over a batch.
+        """
+        posterior = prepared["state_posterior"].detach().clone().requires_grad_(True)
+        pi_prior = prepared["pi_prior"].detach().clone().requires_grad_(True)
+        prediction = prepared["prediction"]
+        if not prediction.requires_grad:
+            prediction = prediction.detach().requires_grad_(True)
+
+        pi_obs = prepared["pi_obs"].clamp_min(self.config.min_precision)
+        gamma_obs = torch.log(pi_obs).detach().requires_grad_(True)
+        return (
+            prepared["state_prior"],
+            posterior,
+            prepared["f_transition"],
+            pi_prior,
+            prepared["actual"],
+            pi_obs,
+            gamma_obs,
+            prediction,
+        )
+
+    def _free_energy_batch(self, objective_inputs: list[tuple[torch.Tensor, ...]]):
+        """Evaluate same-shaped per-frame objectives with ``torch.vmap``.
+
+        A fallback keeps support for unusual custom functions whose outputs
+        change shape from one frame to another. In the common fixed-shape case,
+        vmap removes the Python loop around the per-frame free-energy algebra
+        while retaining autograd paths into each model prediction.
+        """
+        if not objective_inputs:
+            return []
+        # For very small batches, Python dispatch costs less than setting up
+        # the vmap transform; keep the scalar path in that case.
+        if len(objective_inputs) < 4:
+            return [self.agent.free_energy(*items) for items in objective_inputs]
+
+        same_shapes = all(
+            all(tuple(items[i].shape) == tuple(objective_inputs[0][i].shape)
+                for i in range(len(objective_inputs[0])))
+            for items in objective_inputs[1:]
+        )
+        if not same_shapes:
+            return [self.agent.free_energy(*items) for items in objective_inputs]
+
+        stacked = tuple(
+            torch.stack([items[index] for items in objective_inputs], dim=0)
+            for index in range(len(objective_inputs[0]))
+        )
+        # Agent_DAIH.free_energy is a pure tensor expression; mapping its
+        # leading batch dimension is safe and preserves its exact formula.
+        try:
+            mapped = torch.vmap(self.agent.free_energy)(*stacked)
+            return list(mapped.unbind(0))
+        except (RuntimeError, TypeError, NotImplementedError):
+            # Preserve support for applications that subclass/override the
+            # free-energy function with operations lacking vmap rules.
+            return [self.agent.free_energy(*items) for items in objective_inputs]
+
     def _optimize_world_model(self, observations: dict):
         groups = self._parameter_groups()
         if not groups:
@@ -742,22 +806,44 @@ class _LegacyOfflineTrainer:
         optimizer = self._optimizer
         optimizer.zero_grad(set_to_none=True)
 
-        losses = []
         state_names = [
             name for name, node in self.agent.navigator.graph.items()
             if node.get("type") == "state"
         ]
         batches = observations if (isinstance(observations, list) and observations and isinstance(observations[0], tuple)) else [(observations, self._snapshot_beliefs())]
-        for frame, belief_context in batches:
+
+        # First prepare frames in the original frame-major/state-major order.
+        # Belief contexts are installed one at a time and never vmapped: in
+        # temporal mode they encode a recurrence across observations.
+        prepared_by_state: dict[str, list[tuple[int, tuple[torch.Tensor, ...]]]] = {
+            name: [] for name in state_names
+        }
+        for frame_index, (frame, belief_context) in enumerate(batches):
             allowed_states = self._allowed_states_for_frame(frame)
             with self._using_beliefs(belief_context):
                 for state_name in state_names:
                     if allowed_states is not None and state_name not in allowed_states:
                         continue
-                    _, _, F_value = self._state_objective(state_name, frame)
-                    if F_value.requires_grad and torch.isfinite(F_value):
-                        losses.append(F_value / max(1, len(batches)))
+                    prepared = self._prepared_state(state_name, frame)
+                    prepared_by_state[state_name].append((
+                        frame_index,
+                        self._objective_inputs_from_prepared(prepared),
+                    ))
 
+        # Vectorize only the pure free-energy calculation. Store results by
+        # original frame/state order so summation and compatibility semantics
+        # remain the same as before batching.
+        frame_losses: list[list[torch.Tensor]] = [[] for _ in batches]
+        for state_name in state_names:
+            entries = prepared_by_state[state_name]
+            if not entries:
+                continue
+            values = self._free_energy_batch([items for _, items in entries])
+            for (frame_index, _), value in zip(entries, values):
+                if value.requires_grad and bool(torch.isfinite(value).detach().item()):
+                    frame_losses[frame_index].append(value / max(1, len(batches)))
+
+        losses = [loss for frame_items in frame_losses for loss in frame_items]
         if not losses:
             return {"updated": False, "loss": None, "parameters": 0}
 
@@ -780,6 +866,8 @@ class _LegacyOfflineTrainer:
             "updated": bool(parameters),
             "loss": finite_float(total_loss.detach().item()),
             "parameters": sum(parameter.numel() for parameter in parameters),
+            "vectorized_states": sum(bool(items) for items in prepared_by_state.values()),
+            "vectorized_frames": sum(len(items) for items in prepared_by_state.values()),
         }
 
     def _policy_candidate_posterior(self, policy_output, base_inputs=None):

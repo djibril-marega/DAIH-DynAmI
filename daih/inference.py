@@ -35,23 +35,19 @@ def euler_update(mu, dt, F_value, max_grad_norm):
 
 
 def second_derivative_F(mu, F_value):
-    """
-    Computes one Hessian matrix per group.
+    """Compute one diagonal Hessian block per group.
 
-    mu: (a, b) or (a,)
-    F_value: (), (a,) or (a, b)
-    Returns: (a, b, b)
+    For each group, all coordinate-wise vector-Jacobian products are evaluated
+    together by PyTorch's vmap-backed autograd engine. We intentionally keep
+    the outer group loop: materializing cross-group Hessian blocks would waste
+    memory because the caller only consumes each group's diagonal block.
     """
     if not mu.requires_grad:
         raise ValueError("mu must require gradients.")
 
-    if mu.ndim == 1:
-        mu_view = mu.unsqueeze(-1)
-    elif mu.ndim == 2:
-        mu_view = mu
-    else:
+    mu_view = mu.unsqueeze(-1) if mu.ndim == 1 else mu
+    if mu_view.ndim != 2:
         raise ValueError("mu must have 1 or 2 dimensions.")
-
     a, b = mu_view.shape
 
     if F_value.ndim == 0:
@@ -66,46 +62,50 @@ def second_derivative_F(mu, F_value):
         )
 
     hessians = []
-
-    for i, F_i in enumerate(objectives):
+    coordinate_basis = torch.eye(b, dtype=mu.dtype, device=mu.device)
+    for i, objective in enumerate(objectives):
         grad = torch.autograd.grad(
-            F_i,
-            mu,
-            create_graph=True,
-            retain_graph=True,
-            allow_unused=True
+            objective, mu, create_graph=True, retain_graph=True,
+            allow_unused=True,
         )[0]
-
         if grad is None:
-            hessians.append(torch.zeros(
-                (b, b), dtype=mu.dtype, device=mu.device
-            ))
+            hessians.append(mu.new_zeros((b, b)))
             continue
 
         grad_i = grad.reshape(a, b)[i]
-        rows = []
+        if not grad_i.requires_grad:
+            hessians.append(mu.new_zeros((b, b)))
+            continue
 
-        for j in range(b):
-            if not grad_i[j].requires_grad:
-                second_grad = None
-            else:
+        try:
+            if b < 4:
+                raise NotImplementedError("Scalar path is faster for tiny groups.")
+            second = torch.autograd.grad(
+                outputs=grad_i,
+                inputs=mu,
+                grad_outputs=coordinate_basis,
+                retain_graph=True,
+                allow_unused=True,
+                is_grads_batched=True,
+            )[0]
+            hessian = (
+                mu.new_zeros((b, b)) if second is None
+                else second.reshape(b, a, b)[:, i, :]
+            )
+        except (RuntimeError, TypeError, NotImplementedError):
+            # Scalar fallback for custom autograd operators without batching rules.
+            rows = []
+            for j in range(b):
                 second_grad = torch.autograd.grad(
-                    grad_i[j],
-                    mu,
-                    retain_graph=True,
-                    allow_unused=True
-                )[0]
+                    grad_i[j], mu, retain_graph=True, allow_unused=True
+                )[0] if grad_i[j].requires_grad else None
+                rows.append(
+                    mu.new_zeros((b,)) if second_grad is None
+                    else second_grad.reshape(a, b)[i]
+                )
+            hessian = torch.stack(rows)
 
-            if second_grad is None:
-                row = torch.zeros(b, dtype=mu.dtype, device=mu.device)
-            else:
-                row = second_grad.reshape(a, b)[i]
-
-            rows.append(row)
-
-        H_i = torch.stack(rows)
-        H_i = 0.5 * (H_i + H_i.T)
-        hessians.append(H_i)
+        hessians.append(0.5 * (hessian + hessian.transpose(-2, -1)))
 
     return torch.stack(hessians)
 
@@ -335,7 +335,12 @@ def seconde_derivative_from_output(
     eps,
     Pi_bruit=None
 ):
-    """Compute one Jacobian-propagated precision matrix per group."""
+    """Compute Jacobian-propagated precision with batched per-group VJPs.
+
+    Only the diagonal input/output group blocks are required by the model, so
+    each group's output coordinates are vmapped together without constructing
+    the much larger full cross-group Jacobian.
+    """
     if f_out.ndim not in (1, 2):
         raise ValueError("f_out must have 1 or 2 dimensions.")
     if not mu.requires_grad:
@@ -350,33 +355,45 @@ def seconde_derivative_from_output(
         mu = mu.unsqueeze(-1)
 
     a, b = f_out.shape
+    coordinate_basis = torch.eye(b, dtype=mu.dtype, device=mu.device)
     jacobians = []
-
     for group in range(a):
-        rows = []
-        for j in range(b):
-            output_scalar = f_out[group, j]
-            if output_scalar.requires_grad:
-                grad_mu = torch.autograd.grad(
-                    outputs=output_scalar,
-                    inputs=mu,
-                    retain_graph=True,
-                    create_graph=False,
-                    allow_unused=True
-                )[0]
-            else:
-                grad_mu = None
-
-            if grad_mu is None:
-                grad_group = torch.zeros(
-                    b, dtype=mu.dtype, device=mu.device
+        try:
+            if b < 4 or b >= 24:
+                raise NotImplementedError("Scalar path is faster for this group width.")
+            group_jacobian = torch.autograd.grad(
+                outputs=f_out[group],
+                inputs=mu,
+                grad_outputs=coordinate_basis,
+                retain_graph=True,
+                allow_unused=True,
+                is_grads_batched=True,
+            )[0]
+            jacobian = (
+                mu.new_zeros((b, b)) if group_jacobian is None
+                else group_jacobian.reshape(b, a, b)[:, group, :]
+            )
+        except (RuntimeError, TypeError, NotImplementedError):
+            # Legacy fallback for custom operations without vmap batching rules.
+            rows = []
+            for j in range(b):
+                output_scalar = f_out[group, j]
+                grad_mu = (
+                    torch.autograd.grad(
+                        outputs=output_scalar,
+                        inputs=mu,
+                        retain_graph=True,
+                        create_graph=False,
+                        allow_unused=True,
+                    )[0]
+                    if output_scalar.requires_grad else None
                 )
-            else:
-                grad_group = grad_mu[group].reshape(-1)
-            rows.append(grad_group)
-
-        jacobians.append(torch.stack(rows, dim=0))
-
+                rows.append(
+                    mu.new_zeros((b,)) if grad_mu is None
+                    else grad_mu[group].reshape(-1)
+                )
+            jacobian = torch.stack(rows, dim=0)
+        jacobians.append(jacobian)
     J = torch.stack(jacobians, dim=0)
 
     if Pi_bruit is None:
