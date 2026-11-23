@@ -1,9 +1,9 @@
 """Adaptive offline optimization for Agent_DAIH (v12).
 
-The shared WorldModel is optimized against the sum of all state free energies.
+The shared WorldGenerativeModel is optimized against the sum of all state free energies.
 Policy generators are optimized separately with expected-free-energy policy
  gradients and a G_prior/G_posterior alignment loss. The controller has one
-shared progression for WorldModel phases 1-3 and independent per-state
+shared progression for WorldGenerativeModel phases 1-3 and independent per-state
 progression for agent-architecture phases 4-8.
 
 Offline learning performs temporary per-observation inference, then restores persistent posterior beliefs Q and online observation precisions.
@@ -78,8 +78,8 @@ class OfflineConfig:
     # Dataset semantics: temporal carries beliefs through a trajectory; independent resets beliefs per sample.
     observation_mode: str = "temporal"  # temporal | independent
 
-    # Training scopes. The WorldModel objective remains the sum of all F_i.
-    train_world_model: bool = True
+    # Training scopes. The WorldGenerativeModel objective remains the sum of all F_i.
+    train_world_generative_model: bool = True
     train_policy: bool = True
     # The motor function is user-owned. Its training is opt-in and delegated
     # to the user-provided motor_train_fn callback.
@@ -92,8 +92,8 @@ class OfflineConfig:
     policy_baseline_momentum: float = 0.9
 
     neuron_step: int = 1
-    world_model_min_neurons: int = 64
-    world_model_max_neurons: int = 512
+    world_generative_model_min_neurons: int = 64
+    world_generative_model_max_neurons: int = 512
     max_total_states: int | None = 64  # Legacy global safety cap; graph_constraints.max_states is preferred.
     graph_constraints: dict[str, Any] = field(default_factory=dict)
     state_constraints: dict[str, dict[str, Any]] = field(default_factory=dict)
@@ -145,9 +145,9 @@ class _LegacyOfflineTrainer:
     """Stateful offline trainer; progress survives successive method calls."""
 
     PHASE_NAMES = {
-        1: "shared_world_model_weights",
+        1: "shared_world_generative_model_weights",
         2: "generative_hyperparameters",
-        3: "shared_world_model_capacity",
+        3: "shared_world_generative_model_capacity",
         4: "state_local_intermediate_layers",
         5: "state_local_generalized_coordinates",
         6: "state_local_under_states",
@@ -165,7 +165,7 @@ class _LegacyOfflineTrainer:
             self.config = OfflineConfig(**config)
 
         self._validate_config()
-        # One shared controller governs WorldModel phases 1-3. Per-state
+        # One shared controller governs WorldGenerativeModel phases 1-3. Per-state
         # controllers are created only when the local agent phases begin.
         self.global_progress = StateProgress(history=deque(maxlen=self.config.derivative_window))
         self.progress: dict[str, StateProgress] = {}
@@ -211,10 +211,10 @@ class _LegacyOfflineTrainer:
             raise ValueError("phase_min_iterations must be >= 1.")
         if not 1 <= int(self.config.max_phase) <= 8:
             raise ValueError("max_phase must be an integer between 1 and 8.")
-        if self.config.world_model_min_neurons < 16:
-            raise ValueError("world_model_min_neurons must be >= 16.")
-        if self.config.world_model_max_neurons < self.config.world_model_min_neurons:
-            raise ValueError("world_model_max_neurons must be >= world_model_min_neurons.")
+        if self.config.world_generative_model_min_neurons < 16:
+            raise ValueError("world_generative_model_min_neurons must be >= 16.")
+        if self.config.world_generative_model_max_neurons < self.config.world_generative_model_min_neurons:
+            raise ValueError("world_generative_model_max_neurons must be >= world_generative_model_min_neurons.")
         graph_constraints = self.config.graph_constraints
         min_states = int(graph_constraints.get("min_states", 1))
         max_states = graph_constraints.get("max_states")
@@ -604,13 +604,13 @@ class _LegacyOfflineTrainer:
         return prepared, posterior, F_value
 
     def _supports_native_batch(self, state_name: str) -> bool:
-        """Return whether this state's f/g path is backed by batch-aware WorldModels.
+        """Return whether this state's f/g path is backed by batch-aware WorldGenerativeModels.
 
         User-registered local callables are deliberately excluded unless they
         explicitly advertise ``supports_batch = True``. This avoids silently
         changing the semantics of legacy scalar callables.
         """
-        from ..world_model import WorldModel
+        from ..world_generative_model import WorldGenerativeModel
 
         relevant = [state_name]
         relevant.extend(self.agent.navigator.parent_nodes(state_name, node_type="state"))
@@ -620,7 +620,7 @@ class _LegacyOfflineTrainer:
                 if ref is None:
                     continue
                 module = (self.agent.functions_map or {}).get(ref)
-                if isinstance(module, WorldModel):
+                if isinstance(module, WorldGenerativeModel):
                     state_id = self.agent.states_list.index(name) + 1
                     layer_id = self.agent.navigator.get_state_layer(name)
                     if module.has_local_function(state_id, layer_id, kind):
@@ -969,7 +969,7 @@ class _LegacyOfflineTrainer:
             # free-energy function with operations lacking vmap rules.
             return [self.agent.free_energy(*items) for items in objective_inputs]
 
-    def _optimize_world_model(self, observations: dict):
+    def _optimize_world_generative_model(self, observations: dict):
         groups = self._parameter_groups()
         if not groups:
             return {"updated": False, "loss": None, "parameters": 0}
@@ -1513,7 +1513,7 @@ class _LegacyOfflineTrainer:
         if not items:
             raise ValueError("Cannot aggregate an empty metric collection.")
         return StateMetrics(
-            state="__world_model__",
+            state="__world_generative_model__",
             free_energy=finite_float(sum(item.free_energy for item in items)),
             gradient_norm=finite_float(math.sqrt(sum(item.gradient_norm ** 2 for item in items))),
             gradient_raw=[value for item in items for value in item.gradient_raw],
@@ -1548,7 +1548,7 @@ class _LegacyOfflineTrainer:
         for item in self.progress.values():
             item.phase = min(item.phase, max_phase)
         if self.config.weights_only:
-            return ({"world_model": {
+            return ({"world_generative_model": {
                 "phase": self.global_progress.phase,
                 "phase_name": self.PHASE_NAMES[min(self.global_progress.phase, 8)],
                 "weights_only": True,
@@ -1556,7 +1556,7 @@ class _LegacyOfflineTrainer:
             }}, proposed)
 
         # --------------------------------------------------------------
-        # Shared WorldModel: phases 1-3 are controlled globally from all F_i.
+        # Shared WorldGenerativeModel: phases 1-3 are controlled globally from all F_i.
         # --------------------------------------------------------------
         aggregate = self._aggregate_metrics(metrics)
         global_state = self.global_progress
@@ -1594,20 +1594,20 @@ class _LegacyOfflineTrainer:
                 global_state.phase_best_free_energy = aggregate.free_energy
                 global_state.history.clear()
                 self.progress.clear()
-                decisions["world_model"] = {
+                decisions["world_generative_model"] = {
                     "phase_before": global_phase_before,
                     "phase": 3,
                     "phase_name": self.PHASE_NAMES[3],
                     "free_energy": aggregate.free_energy,
                     "shock": global_shock,
-                    "transition": "backtrack_to_shared_world_model",
+                    "transition": "backtrack_to_shared_world_generative_model",
                     "mutation": None,
                 }
                 return decisions, proposed
 
         if global_state.phase < 4:
             if global_state.pending_mutation:
-                decisions["world_model"] = {
+                decisions["world_generative_model"] = {
                     "phase_before": global_phase_before,
                     "phase": global_state.phase,
                     "phase_name": self.PHASE_NAMES[global_state.phase],
@@ -1634,7 +1634,7 @@ class _LegacyOfflineTrainer:
                 ), next(iter(metrics)))
                 global_operation = self._mutation_for(target, global_state.phase, True)
                 if global_operation.get("action") != "none":
-                    global_operation["scope"] = "world_model"
+                    global_operation["scope"] = "world_generative_model"
                     proposed.append(global_operation)
                     global_state.pending_mutation = True
             elif global_transition:
@@ -1654,7 +1654,7 @@ class _LegacyOfflineTrainer:
                             )
                         ), next(iter(metrics)))
                         global_operation = self._mutation_for(target, 3, False)
-                        global_operation["scope"] = "world_model"
+                        global_operation["scope"] = "world_generative_model"
                         proposed.append(global_operation)
                         global_state.pending_mutation = True
                 elif global_state.phase == 3 and max_phase >= 4:
@@ -1670,7 +1670,7 @@ class _LegacyOfflineTrainer:
                 # At the selected ceiling, remain in that phase. Optimization
                 # and same-phase maintenance can continue, but later phases cannot start.
 
-            decisions["world_model"] = {
+            decisions["world_generative_model"] = {
                 "phase_before": global_phase_before,
                 "phase": global_state.phase,
                 "phase_name": self.PHASE_NAMES[global_state.phase],
@@ -1684,7 +1684,7 @@ class _LegacyOfflineTrainer:
                 "shock_triggered": global_transition,
                 "decorrelation": global_decorrelated,
                 "mutation": global_operation,
-                "scope": "all_states_shared_world_model",
+                "scope": "all_states_shared_world_generative_model",
             }
             if global_state.phase < 4:
                 return decisions, proposed
@@ -2008,8 +2008,8 @@ class _LegacyOfflineTrainer:
         # generative model against the mean sequence objective. Persistent agent
         # beliefs and online observation precisions are restored afterwards.
         optimization = (
-            self._optimize_world_model(training_batches)
-            if self.config.train_world_model
+            self._optimize_world_generative_model(training_batches)
+            if self.config.train_world_generative_model
             else {"updated": False, "loss": None, "parameters": 0, "disabled": True}
         )
         if self.config.train_policy:
@@ -2051,7 +2051,7 @@ class _LegacyOfflineTrainer:
             "version": "7.2",
             "max_phase": int(self.config.max_phase),
             "weights_only": bool(self.config.weights_only),
-            "train_world_model": bool(self.config.train_world_model),
+            "train_world_generative_model": bool(self.config.train_world_generative_model),
             "train_policy": bool(self.config.train_policy),
             "observation_mode": self.config.observation_mode,
             "observations_processed": len(training_frames),
@@ -2076,7 +2076,7 @@ class _LegacyOfflineTrainer:
             "optimization": optimization,
             "policy_optimization": policy_optimization,
             "note": (
-                "Shared WorldModel parameters are optimized against the sum of all state free energies. "
+                "Shared WorldGenerativeModel parameters are optimized against the sum of all state free energies. "
                 "Policy generators use expected-free-energy REINFORCE and G_prior/G_posterior alignment. "
                 "Phase-4 context blocks are state/layer-local; later coordinate/state/hierarchy mutations "
                 "are local to their target declaration. Per-observation beliefs are temporary; "
@@ -2110,7 +2110,7 @@ class _LegacyOfflineTrainer:
             plan_to_persist["mutation_result"] = rebuild_result
             for skipped_mutation in rebuild_result.get("skipped", []):
                 target = skipped_mutation.get("target")
-                if skipped_mutation.get("scope") == "world_model":
+                if skipped_mutation.get("scope") == "world_generative_model":
                     self.global_progress.pending_mutation = False
                     if self.global_progress.phase < min(3, int(self.config.max_phase)):
                         self.global_progress.phase += 1
@@ -2141,7 +2141,7 @@ class _LegacyOfflineTrainer:
                 # regularization), not architecture rebuilds.
                 for applied_mutation in rebuild_result.get("applied", []):
                     target = applied_mutation.get("target")
-                    if applied_mutation.get("scope") == "world_model":
+                    if applied_mutation.get("scope") == "world_generative_model":
                         self.global_progress.pending_mutation = False
                         self.global_progress.phase_iterations = 0
                         self.global_progress.history.clear()
@@ -2845,7 +2845,7 @@ class OfflineTrainer(_LegacyOfflineTrainer):
                         if predicted.numel() != target.numel():
                             continue
                         predicted = predicted.reshape_as(target)
-                    # Exact specified WorldModel objective: sum_t ||s_x(t)-s_y(t)||^2.
+                    # Exact specified WorldGenerativeModel objective: sum_t ||s_x(t)-s_y(t)||^2.
                     step_loss = (predicted - target).square().sum()
                     if torch.isfinite(step_loss):
                         losses.append(step_loss)
@@ -2976,7 +2976,7 @@ class OfflineTrainer(_LegacyOfflineTrainer):
             "horizons_used": used_horizons,
         }
 
-    def _optimize_temporal_world_model(self):
+    def _optimize_temporal_world_generative_model(self):
         groups = self._parameter_groups()
         if not groups:
             return {"updated": False, "loss": None, "pairs": 0, "parameters": 0}
@@ -3320,7 +3320,7 @@ class OfflineTrainer(_LegacyOfflineTrainer):
         if self.macro_phase in (1, 2):
             # PHASE I — observation memory only.
             selected, top_k_info = self._select_surprising_contexts(contexts)
-            hierarchical = self._optimize_world_model(selected)
+            hierarchical = self._optimize_world_generative_model(selected)
             F_hierarchical, _ = self._evaluate(selected)
             self._hierarchical_history.append(float(F_hierarchical))
             status_h = self._objective_status(
@@ -3333,7 +3333,7 @@ class OfflineTrainer(_LegacyOfflineTrainer):
             # PHASE II — transition memory only. No observation contexts or raw
             # observation frames are passed into either temporal or policy loss.
             self._temporal_surprise_trace = []
-            temporal = self._optimize_temporal_world_model()
+            temporal = self._optimize_temporal_world_generative_model()
             temporal_surprises = sorted(
                 self._temporal_surprise_trace,
                 key=lambda item: item["surprise"], reverse=True,

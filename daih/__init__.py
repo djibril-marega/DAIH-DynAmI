@@ -2,6 +2,13 @@
 __version__ = "4.0.0"
 
 from .agent import Agent_DAIH
+from .world_generative_model import WorldGenerativeModel, WorldGenerativeModelOutput
 from .offline_training.offline import OfflineConfig
 
-__all__ = ["Agent_DAIH", "OfflineConfig", "__version__"]
+__all__ = [
+    "Agent_DAIH",
+    "OfflineConfig",
+    "WorldGenerativeModel",
+    "WorldGenerativeModelOutput",
+    "__version__",
+]

@@ -682,7 +682,7 @@ class Agent_DAIH:
                 next_pi_p = utils.update_wih_grad_desc(
                     pi_p, error_eps, dt=0.1, k=self.lr_policies
                 )
-                self.pi_p[state_name] = torch.exp(next_pi_p.detach())
+                self.pi_p[state_name] = next_pi_p.detach()
             except UnboundLocalError:
                 break
 

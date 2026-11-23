@@ -504,10 +504,10 @@ The graph:
 
 Group names do not become nodes.
 
-## 12. Preprocessing and WorldModel Input Dimensions
+## 12. Preprocessing and WorldGenerativeModel Input Dimensions
 
 The preprocessing layer converts graph metadata and current values into the
-arguments expected by `WorldModel.forward()`.
+arguments expected by `WorldGenerativeModel.forward()`.
 
 ### Common arguments
 
@@ -520,7 +520,7 @@ $$
 \mathrm{index}(\text{state\_name},\text{states\_list}) + 1
 $$
 
-The common arguments passed to the world model are `state`, `state_id`,
+The common arguments passed to the generative world model are `state`, `state_id`,
 `layer_id`, and `function_type`.
 
 ### Action inputs
@@ -528,7 +528,7 @@ The common arguments passed to the world model are `state`, `state_id`,
 An input name is recognized as an action when it is either an individual
 action node or an action group. Its value must be present in `inputs_map`.
 
-The world model accepts only one action argument per call: one individual
+The generative world model accepts only one action argument per call: one individual
 action or one action group. Declaring more than one detected action input
 raises an error.
 
@@ -747,3 +747,12 @@ dependencies, distributions, and node groups. The initialization code
 checks part of their consistency and builds internal structures;
 temporal rules and actual function execution must be provided by the
 model engine.
+
+## WorldGenerativeModel naming
+
+The shared neural generative component is implemented by
+`daih.world_generative_model.WorldGenerativeModel`. Offline-training options
+that control this component consistently use the `world_generative_model`
+prefix (for example, `train_world_generative_model`,
+`world_generative_model_min_neurons`, and
+`world_generative_model_max_neurons`).

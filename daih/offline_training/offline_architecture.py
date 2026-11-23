@@ -7,7 +7,7 @@ import torch
 from torch import nn
 from torch.nn.utils import prune
 
-from ..world_model import WorldModel
+from ..world_generative_model import WorldGenerativeModel
 
 
 class OfflineArchitecture:
@@ -408,7 +408,7 @@ class OfflineArchitecture:
             target_id = self.agent.states_list.index(target) + 1
             target_layer = int(target_spec.get("layer", 0))
             has_local_g = (
-                isinstance(target_g_module, WorldModel)
+                isinstance(target_g_module, WorldGenerativeModel)
                 and target_g_module.has_local_function(target_id, target_layer, "g")
             )
             if has_local_g and getattr(self.agent, "_local_function_factory", None) is None:
@@ -449,14 +449,14 @@ class OfflineArchitecture:
         return True
 
     @staticmethod
-    def _resize_world_model(old: WorldModel, add_neurons: int = 0, add_layer: bool = False):
+    def _resize_world_generative_model(old: WorldGenerativeModel, add_neurons: int = 0, add_layer: bool = False):
         old_hidden = int(old.hidden_dim)
         old_policy_hidden = int(old.policy_generator.initial_hidden.out_features)
         new_hidden = max(16, old_hidden + add_neurons)
         # Policy capacity is optimized by its own objective, not by the
-        # shared generative WorldModel neuron phase.
+        # shared generative WorldGenerativeModel neuron phase.
         new_policy_hidden = old_policy_hidden
-        new = WorldModel(
+        new = WorldGenerativeModel(
             hidden_dim=new_hidden,
             id_embedding_dim=old.state_embedding.embedding_dim,
             id_buckets=old.id_buckets,
@@ -513,7 +513,7 @@ class OfflineArchitecture:
         return weight.detach().abs() * gradient.detach().abs()
 
     @classmethod
-    def _reorder_world_model_channels(cls, model: WorldModel) -> list[int]:
+    def _reorder_world_generative_model_channels(cls, model: WorldGenerativeModel) -> list[int]:
         """Move least useful shared hidden channels to the tail before pruning.
 
         Importance is a first-order |weight * gradient| proxy aggregated over
@@ -579,14 +579,14 @@ class OfflineArchitecture:
                         linear.weight[:, :width].copy_(linear.weight[:, :width].index_select(1, order))
         return order.detach().cpu().tolist()
 
-    def _replace_world_model(self, delta: int = 0, add_layer: bool = False):
+    def _replace_world_generative_model(self, delta: int = 0, add_layer: bool = False):
         old_modules = []
         seen = set()
         for value in self.agent.functions_map.values():
-            if isinstance(value, WorldModel) and id(value) not in seen:
+            if isinstance(value, WorldGenerativeModel) and id(value) not in seen:
                 seen.add(id(value))
                 old_modules.append(value)
-        replacements = {id(old): self._resize_world_model(old, delta, add_layer) for old in old_modules}
+        replacements = {id(old): self._resize_world_generative_model(old, delta, add_layer) for old in old_modules}
         for key, value in list(self.agent.functions_map.items()):
             if id(value) in replacements:
                 self.agent.functions_map[key] = replacements[id(value)]
@@ -622,7 +622,7 @@ class OfflineArchitecture:
         Utility is approximated by |w|*|grad(w)| from the immediately
         preceding optimization step. The lowest configured fraction is
         removed globally, while preserving a minimum number of active entries
-        in every tensor. Since WorldModel instances may be shared by several
+        in every tensor. Since WorldGenerativeModel instances may be shared by several
         states, pruning is intentionally reported as shared-module pruning.
         """
         fraction = float(self.config.prune_fraction)
@@ -793,7 +793,7 @@ class OfflineArchitecture:
                 layer_id = int(gf[state].get("layer", 0))
                 modules, seen = [], set()
                 for value in self.agent.functions_map.values():
-                    if isinstance(value, WorldModel) and id(value) not in seen:
+                    if isinstance(value, WorldGenerativeModel) and id(value) not in seen:
                         modules.append(value)
                         seen.add(id(value))
                 counts = [m.local_context_layer_count(state_id, layer_id) for m in modules]
@@ -928,15 +928,15 @@ class OfflineArchitecture:
                 and self._constraint(m.get("target"))["allow_neurons"]
             ]
             if limits:
-                old_modules = [v for v in self.agent.functions_map.values() if isinstance(v, WorldModel)]
+                old_modules = [v for v in self.agent.functions_map.values() if isinstance(v, WorldGenerativeModel)]
                 if old_modules:
                     old_dim = old_modules[0].hidden_dim
                     min_dim = max(
-                        int(self.config.world_model_min_neurons),
+                        int(self.config.world_generative_model_min_neurons),
                         max(int(x["min_neurons"]) for x in limits),
                     )
                     max_dim = min(
-                        int(self.config.world_model_max_neurons),
+                        int(self.config.world_generative_model_max_neurons),
                         min(int(x["max_neurons"]) for x in limits),
                     )
                     delta = max(min_dim - old_dim, min(max_dim - old_dim, world_neuron_delta))
@@ -946,8 +946,8 @@ class OfflineArchitecture:
                             for module in old_modules:
                                 if id(module) not in seen_models:
                                     seen_models.add(id(module))
-                                    self._reorder_world_model_channels(module)
-                        self._replace_world_model(delta=delta)
+                                    self._reorder_world_generative_model_channels(module)
+                        self._replace_world_generative_model(delta=delta)
                         trainer = getattr(self.agent, "_offline_trainer", None)
                         if trainer is not None:
                             trainer.invalidate_optimizer()
@@ -1056,7 +1056,7 @@ class OfflineArchitecture:
 
         # Remap local-function registrations if state IDs shifted after deletion.
         new_states = list(D)
-        for module in {id(v): v for v in old_functions_map.values() if isinstance(v, WorldModel)}.values():
+        for module in {id(v): v for v in old_functions_map.values() if isinstance(v, WorldGenerativeModel)}.values():
             registrations = []
             for key, fn in module._local_functions.items():
                 old_id, layer_id, kind = key
@@ -1129,7 +1129,7 @@ class OfflineArchitecture:
                 module = agent.functions_map.get(old_spec.get("g"))
                 new_id = agent.states_list.index(state_name) + 1
                 new_layer = int(gf[state_name].get("layer", 0))
-                if isinstance(module, WorldModel) and module.has_local_function(new_id, new_layer, "g"):
+                if isinstance(module, WorldGenerativeModel) and module.has_local_function(new_id, new_layer, "g"):
                     module.unregister_local_function(new_id, new_layer, "g")
                     required_local_g.append((state_name, old_spec.get("g")))
             installed = agent.install_local_functions(factory_states)

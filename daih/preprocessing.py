@@ -242,7 +242,7 @@ def map_outputs(output_names, output, navigator):
     """
     Map function outputs to graph-declared output names.
 
-    WorldModel has already consumed any local masks before this function
+    WorldGenerativeModel has already consumed any local masks before this function
     receives the result. This function only associates final output matrices
     with their graph-declared names.
 
@@ -272,7 +272,7 @@ def map_outputs(output_names, output, navigator):
         }
 
     # Multiple outputs: one final matrix per declared name. Any local masks
-    # have already been consumed by WorldModel.
+    # have already been consumed by WorldGenerativeModel.
     if isinstance(output, Mapping):
         missing = [name for name in output_names if name not in output]
         extra = [name for name in output if name not in output_names]
@@ -374,7 +374,7 @@ def execute_named_function(
     input_names = get_io_names(navigator, state, function_name, "input")
     output_names = get_io_names(navigator, state, function_name, "output")
     #kwargs = prepare_inputs(input_names, inputs_map)
-    kwargs = prepare_world_model_inputs(
+    kwargs = prepare_world_generative_model_inputs(
         navigator, input_names, inputs_map, state, states_list,
         function_type, Q_, output_names=output_names
     )
@@ -449,7 +449,7 @@ def execute_flat_function(
     """
     Execute f/g/p/V and return a single 1D vector.
 
-    WorldModel returns final matrices only. Outputs are associated with the
+    WorldGenerativeModel returns final matrices only. Outputs are associated with the
     names declared in the graph, then flattened and concatenated in output_*
     order.
     """
@@ -644,7 +644,7 @@ def get_named_output_shapes(navigator, output_names, Q_):
     return tuple(shapes)
 
 
-def prepare_world_model_inputs(
+def prepare_world_generative_model_inputs(
     navigator,
     input_names,
     inputs_map,
@@ -655,7 +655,7 @@ def prepare_world_model_inputs(
     output_names=None,
 ):
     """
-    Prepares arguments intended for WorldModel.forward().
+    Prepares arguments intended for WorldGenerativeModel.forward().
 
     For f, g and p, the current state is passed as input.
     For V, the declared input_V is passed instead.
@@ -704,11 +704,11 @@ def prepare_world_model_inputs(
     # Layer identifier
     layer_id = navigator.get_state_layer(state_name)
 
-    # Explicit state identity. WorldModel appends this vector to every input
+    # Explicit state identity. WorldGenerativeModel appends this vector to every input
     # row internally, while retaining the original state shape for outputs
     # and for user-defined local mathematical functions.
     if not states_list:
-        raise ValueError("states_list cannot be empty when preparing WorldModel inputs.")
+        raise ValueError("states_list cannot be empty when preparing WorldGenerativeModel inputs.")
 
     if not torch.is_tensor(state):
         state_tensor = torch.as_tensor(state, dtype=torch.float32)
@@ -755,10 +755,10 @@ def prepare_world_model_inputs(
 
             detected_actions.append(name)
 
-    # WorldModel accepts only a single action or a single group.
+    # WorldGenerativeModel accepts only a single action or a single group.
     if len(detected_actions) > 1:
         raise ValueError(
-            "WorldModel.forward() accepts only a single action, "
+            "WorldGenerativeModel.forward() accepts only a single action, "
             f"but multiple were detected: {detected_actions}"
         )
 

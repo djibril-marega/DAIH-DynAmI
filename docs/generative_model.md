@@ -1,5 +1,12 @@
 # Generative Model Definition Guide
 
+The shared neural component that performs generative predictions is named
+`WorldGenerativeModel` and is implemented in
+`daih/world_generative_model.py`. Import it with either
+`from daih.world_generative_model import WorldGenerativeModel` or, from the
+package root, `from daih import WorldGenerativeModel`. The module and class
+use the `world_generative_model` / `WorldGenerativeModel` naming consistently.
+
 ## Objective
 
 This guide describes how to configure the generative model using

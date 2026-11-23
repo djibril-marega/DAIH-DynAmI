@@ -1,7 +1,7 @@
 """
-world_model.py
+world_generative_model.py
 
-Neuro-symbolic WorldModel with:
+Neuro-symbolic WorldGenerativeModel with:
 - variable-size matrix inputs;
 - state and layer identifiers;
 - four types: f, g, p, and V;
@@ -10,7 +10,7 @@ Neuro-symbolic WorldModel with:
 
 Local functions are user-defined Python callables. Plain callables remain
 outside PyTorch parameter registration; local nn.Module instances are
-registered and can be optimized together with the global WorldModel.
+registered and can be optimized together with the global WorldGenerativeModel.
 """
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Optional, Tuple, Union
@@ -26,7 +26,7 @@ LocalFunction = Callable[..., Union[torch.Tensor, PolicyOutput, tuple, list]]
 
 
 @dataclass
-class WorldModelOutput:
+class WorldGenerativeModelOutput:
     function_type: str
     values: Optional[Any] = None
     policy: Optional[PolicyOutput] = None
@@ -35,7 +35,7 @@ class WorldModelOutput:
     layer_id: Optional[int] = None
 
 
-class WorldModel(nn.Module):
+class WorldGenerativeModel(nn.Module):
     """
     Global prediction model and registry for local mathematical functions.
 
@@ -166,11 +166,11 @@ class WorldModel(nn.Module):
     @staticmethod
     def _type_index(function_type: str) -> int:
         try:
-            return WorldModel.VALID_TYPES.index(function_type)
+            return WorldGenerativeModel.VALID_TYPES.index(function_type)
         except ValueError as exc:
             raise ValueError(
                 f"Unknown type {function_type!r}. Accepted types: "
-                f"{WorldModel.VALID_TYPES}."
+                f"{WorldGenerativeModel.VALID_TYPES}."
             ) from exc
 
     def register_local_function(
@@ -454,7 +454,7 @@ class WorldModel(nn.Module):
         output_shapes: Optional[Tuple[Tuple[int, int], ...]] = None,
         max_steps: int = 20,
         deterministic: Optional[bool] = None,
-    ) -> WorldModelOutput:
+    ) -> WorldGenerativeModelOutput:
         """
         Executes local functions and completes masked values with neural predictions.
 
@@ -469,7 +469,7 @@ class WorldModel(nn.Module):
         x, original_2d = self._as_batch(state)
 
         # Append the current state's one-hot identity to every input row for
-        # the learned WorldModel path. Keep x itself unchanged: f outputs must
+        # the learned WorldGenerativeModel path. Keep x itself unchanged: f outputs must
         # retain the original state shape, and local mathematical functions
         # must keep their existing input/output contract.
         model_input = x
@@ -596,7 +596,7 @@ class WorldModel(nn.Module):
                         G=G,
                     )
 
-                return WorldModelOutput(
+                return WorldGenerativeModelOutput(
                     function_type="p",
                     policy=policy_result,
                     used_local_function=True,
@@ -708,7 +708,7 @@ class WorldModel(nn.Module):
                         merged = mask * values + (1.0 - mask) * predicted
 
                     # The mask is an internal mechanism: only the merged
-                    # matrix is exposed by WorldModel.
+                    # matrix is exposed by WorldGenerativeModel.
                     merged = self._restore_batch(merged, original_2d)
                     merged_outputs.append(merged)
 
@@ -716,7 +716,7 @@ class WorldModel(nn.Module):
                     merged_outputs[0] if len(merged_outputs) == 1
                     else tuple(merged_outputs)
                 )
-                return WorldModelOutput(
+                return WorldGenerativeModelOutput(
                     function_type="g", values=output_values, used_local_function=True,
                     state_id=int(state_id), layer_id=int(layer_id)
                 )
@@ -786,9 +786,9 @@ class WorldModel(nn.Module):
                 merged = mask * values + (1.0 - mask) * predicted
 
             # Masks are consumed internally and are never part of the
-            # WorldModel public output.
+            # WorldGenerativeModel public output.
             merged = self._restore_batch(merged, original_2d)
-            return WorldModelOutput(
+            return WorldGenerativeModelOutput(
                 function_type=function_type, values=merged, used_local_function=True,
                 state_id=int(state_id), layer_id=int(layer_id)
             )
@@ -800,7 +800,7 @@ class WorldModel(nn.Module):
             policy = self.policy_generator(
                 context, max_steps=max_steps, deterministic=deterministic, temperature=temperature
             )
-            return WorldModelOutput(
+            return WorldGenerativeModelOutput(
                 function_type="p", policy=policy, used_local_function=False,
                 state_id=int(state_id), layer_id=int(layer_id)
             )
@@ -826,7 +826,7 @@ class WorldModel(nn.Module):
 
         if not (function_type == "g" and output_shapes is not None):
             values = self._restore_batch(values, original_2d)
-        return WorldModelOutput(
+        return WorldGenerativeModelOutput(
             function_type=function_type, values=values, used_local_function=False,
             state_id=int(state_id), layer_id=int(layer_id)
         )

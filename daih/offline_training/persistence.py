@@ -208,7 +208,7 @@ def load_agent(
     """Rebuild an agent and restore its parameters and posterior beliefs.
 
     functions_map_factory(checkpoint) must return the application's symbolic
-    function map, including the expected WorldModel modules.
+    function map, including the expected WorldGenerativeModel modules.
     local_functions_factory(agent, checkpoint) must re-register user callables.
     """
     if not callable(functions_map_factory):

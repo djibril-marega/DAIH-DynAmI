@@ -161,7 +161,7 @@ modules.
                                       missing-observation handling, and
                                       precision management.
 
-  `world_model`                       Executes the shared generative
+  `world_generative_model`                       Executes the shared generative
                                       neural model.
 
   `model_components`                  Produces policy candidates and
@@ -196,13 +196,13 @@ is a separate process described in Part II.
 ## Preprocessing and Output Mapping
 
 The preprocessing layer bridges the graph representation and the
-`WorldModel.forward()` interface. It prepares the current state, its
+`WorldGenerativeModel.forward()` interface. It prepares the current state, its
 identifiers, the function type, optional action information, and any
 function-specific parameters.
 
-### Preparing WorldModel inputs
+### Preparing WorldGenerativeModel inputs
 
-`prepare_world_model_inputs(...)` builds a keyword-argument dictionary.
+`prepare_world_generative_model_inputs(...)` builds a keyword-argument dictionary.
 The state must exist in `inputs_map`, and its identifier is obtained from
 its position in `states_list`:
 
@@ -223,7 +223,7 @@ an action when it is an individual action node or an action group
 recognized by `navigator.get_actions_by_group(...)`. The corresponding
 value must exist in `inputs_map`.
 
-`WorldModel.forward()` accepts at most one action argument: either one
+`WorldGenerativeModel.forward()` accepts at most one action argument: either one
 individual action or one action group. If more than one action or group is
 detected, preprocessing raises an error. The action value is passed under
 the `action` keyword.
@@ -700,7 +700,7 @@ The offline controller runs the following cycle.
 
 ### Phase I — Hierarchical Predictions
 
-Phase I optimizes the shared `WorldModel` using observation memory.
+Phase I optimizes the shared `WorldGenerativeModel` using observation memory.
 
 1.  Rebuild temporary belief contexts from stored observation frames.
 2.  Rank the contexts by surprise/free energy.
@@ -726,7 +726,7 @@ batch used by Phase I.
     horizon.
 4.  Dream the trajectory through the generative model and calculate
     temporal prediction losses.
-5.  Optimize the shared temporal world-model parameters.
+5.  Optimize the shared parameters of the temporal generative world model.
 6.  Optimize policy generators using expected-free-energy and
     prior/posterior alignment objectives on compatible transition starts.
 
@@ -779,7 +779,7 @@ intervention is considered.
 The offline architecture manager can evaluate and modify several
 structural dimensions:
 
--   shared WorldModel capacity, including neuron/channel changes and
+-   shared WorldGenerativeModel capacity, including neuron/channel changes and
     intermediate layers;
 -   state-local generalized coordinates;
 -   state-local under-states;
