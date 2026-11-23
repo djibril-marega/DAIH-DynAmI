@@ -704,8 +704,27 @@ def prepare_world_model_inputs(
     # Layer identifier
     layer_id = navigator.get_state_layer(state_name)
 
+    # Explicit state identity. WorldModel appends this vector to every input
+    # row internally, while retaining the original state shape for outputs
+    # and for user-defined local mathematical functions.
+    if not states_list:
+        raise ValueError("states_list cannot be empty when preparing WorldModel inputs.")
+
+    if not torch.is_tensor(state):
+        state_tensor = torch.as_tensor(state, dtype=torch.float32)
+    elif state.is_floating_point():
+        state_tensor = state
+    else:
+        state_tensor = state.to(dtype=torch.float32)
+
+    state_one_hot = torch.nn.functional.one_hot(
+        torch.tensor(state_id - 1, device=state_tensor.device, dtype=torch.long),
+        num_classes=len(states_list),
+    ).to(dtype=state_tensor.dtype)
+
     kwargs = {
-        "state": state,
+        "state": state_tensor,
+        "state_one_hot": state_one_hot,
         "state_id": state_id,
         "layer_id": layer_id,
         "function_type": function_type,

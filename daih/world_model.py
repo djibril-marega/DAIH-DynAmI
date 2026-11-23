@@ -448,6 +448,7 @@ class WorldModel(nn.Module):
         function_type: str,
         *,
         action: Optional[torch.Tensor] = None,
+        state_one_hot: Optional[torch.Tensor] = None,
         temperature: Optional[float] = None,
         output_shape: Optional[Tuple[int, int]] = None,
         output_shapes: Optional[Tuple[Tuple[int, int], ...]] = None,
@@ -466,6 +467,34 @@ class WorldModel(nn.Module):
         """
         self._type_index(function_type)
         x, original_2d = self._as_batch(state)
+
+        # Append the current state's one-hot identity to every input row for
+        # the learned WorldModel path. Keep x itself unchanged: f outputs must
+        # retain the original state shape, and local mathematical functions
+        # must keep their existing input/output contract.
+        model_input = x
+        if state_one_hot is not None:
+            identity = torch.as_tensor(
+                state_one_hot, device=x.device, dtype=x.dtype
+            )
+            if identity.ndim == 1:
+                if identity.numel() < 1:
+                    raise ValueError("state_one_hot cannot be empty.")
+                identity_rows = identity.view(1, 1, -1).expand(
+                    x.shape[0], x.shape[1], -1
+                )
+            elif identity.ndim == 2:
+                if identity.shape[0] not in (1, x.shape[0]):
+                    raise ValueError(
+                        "A batched state_one_hot must have shape [1, S] or [B, S]."
+                    )
+                identity_rows = identity[:, None, :].expand(
+                    x.shape[0], x.shape[1], -1
+                )
+            else:
+                raise ValueError("state_one_hot must have shape [S] or [B, S].")
+            model_input = torch.cat((x, identity_rows), dim=2)
+
         local_key = (int(state_id), int(layer_id), function_type)
         module_key = self._local_module_keys.get(local_key)
         local = (
@@ -656,7 +685,7 @@ class WorldModel(nn.Module):
                     if bool(torch.all(mask == 1)):
                         merged = values
                     else:
-                        context = self.encode_context(x, state_id, layer_id, function_type)
+                        context = self.encode_context(model_input, state_id, layer_id, function_type)
                         flat_local = values.reshape(values.shape[0], -1)
                         local_stats = torch.stack(
                             [
@@ -734,7 +763,7 @@ class WorldModel(nn.Module):
             if bool(torch.all(mask == 1)):
                 merged = values
             else:
-                context = self.encode_context(x, state_id, layer_id, function_type)
+                context = self.encode_context(model_input, state_id, layer_id, function_type)
                 flat_local = values.reshape(values.shape[0], -1)
                 local_stats = torch.stack(
                     [
@@ -765,7 +794,7 @@ class WorldModel(nn.Module):
             )
 
         # No local callable: global computation takes over for the entire output.
-        context = self.encode_context(x, state_id, layer_id, function_type)
+        context = self.encode_context(model_input, state_id, layer_id, function_type)
 
         if function_type == "p":
             policy = self.policy_generator(
