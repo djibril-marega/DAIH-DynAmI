@@ -8,6 +8,7 @@ from torch import nn
 from torch.nn.utils import prune
 
 from ..world_generative_model import WorldGenerativeModel
+from ..policy_generator import PolicyGenerator
 
 
 class OfflineArchitecture:
@@ -449,13 +450,13 @@ class OfflineArchitecture:
         return True
 
     @staticmethod
-    def _resize_world_generative_model(old: WorldGenerativeModel, add_neurons: int = 0, add_layer: bool = False):
+    def _resize_world_generative_model(old: WorldGenerativeModel, add_neurons: int = 0, add_layer: bool = False, policy_hidden_delta: int = 0):
         old_hidden = int(old.hidden_dim)
         old_policy_hidden = int(old.policy_generator.initial_hidden.out_features)
         new_hidden = max(16, old_hidden + add_neurons)
         # Policy capacity is optimized by its own objective, not by the
         # shared generative WorldGenerativeModel neuron phase.
-        new_policy_hidden = old_policy_hidden
+        new_policy_hidden = max(1, old_policy_hidden + int(policy_hidden_delta))
         new = WorldGenerativeModel(
             hidden_dim=new_hidden,
             id_embedding_dim=old.state_embedding.embedding_dim,
@@ -479,6 +480,14 @@ class OfflineArchitecture:
         new_state = new.state_dict()
         for key, target in new_state.items():
             source = old_state.get(key)
+            # torch.nn.utils.prune reparameterizes a weight as weight_orig
+            # plus weight_mask. When rebuilding a wider module, transfer the
+            # effective masked weight into the ordinary destination parameter.
+            if source is None and key.endswith(".weight"):
+                source = old_state.get(key + "_orig")
+                mask = old_state.get(key + "_mask")
+                if source is not None and mask is not None:
+                    source = source * mask
             if source is None or source.ndim != target.ndim:
                 continue
             slices = tuple(slice(0, min(a, b)) for a, b in zip(source.shape, target.shape))
@@ -488,7 +497,14 @@ class OfflineArchitecture:
         # Preserve extra generic intermediate blocks.
         extra = int(getattr(old, "_offline_extra_layers", 0))
         if add_layer:
-            block = nn.Sequential(nn.Linear(new_hidden, new_hidden), nn.GELU())
+            # A new one-neuron bottleneck layer, projected back to the
+            # shared hidden width so the surrounding encoder contract remains
+            # unchanged.
+            block = nn.Sequential(
+                nn.Linear(new_hidden, 1),
+                nn.GELU(),
+                nn.Linear(1, new_hidden),
+            )
             block = block.to(next(new.parameters()).device)
             new.context_encoder = nn.Sequential(*list(new.context_encoder.children()), block)
             extra += 1
@@ -579,14 +595,14 @@ class OfflineArchitecture:
                         linear.weight[:, :width].copy_(linear.weight[:, :width].index_select(1, order))
         return order.detach().cpu().tolist()
 
-    def _replace_world_generative_model(self, delta: int = 0, add_layer: bool = False):
+    def _replace_world_generative_model(self, delta: int = 0, add_layer: bool = False, policy_hidden_delta: int = 0):
         old_modules = []
         seen = set()
         for value in self.agent.functions_map.values():
             if isinstance(value, WorldGenerativeModel) and id(value) not in seen:
                 seen.add(id(value))
                 old_modules.append(value)
-        replacements = {id(old): self._resize_world_generative_model(old, delta, add_layer) for old in old_modules}
+        replacements = {id(old): self._resize_world_generative_model(old, delta, add_layer, policy_hidden_delta) for old in old_modules}
         for key, value in list(self.agent.functions_map.items()):
             if id(value) in replacements:
                 self.agent.functions_map[key] = replacements[id(value)]
@@ -748,6 +764,8 @@ class OfflineArchitecture:
         }
         applied, skipped = [], []
         world_neuron_delta = 0
+        world_add_layer = False
+        world_policy_delta = 0
         local_layer_changes = []
         structural_applied = False
         global_inplace_results = {}
@@ -782,6 +800,16 @@ class OfflineArchitecture:
                 continue
             elif action == "add_neurons" and c["allow_neurons"]:
                 world_neuron_delta += int(self.config.neuron_step)
+                ok = True
+            elif action == "add_world_generative_layer" and c["allow_neurons"]:
+                world_add_layer = True
+                ok = True
+            elif action == "add_neurons_and_world_layer" and c["allow_neurons"]:
+                world_neuron_delta += int(self.config.neuron_step)
+                world_add_layer = True
+                ok = True
+            elif action == "add_policy_neurons" and c["allow_neurons"]:
+                world_policy_delta += int(self.config.neuron_step)
                 ok = True
             elif action == "prune_neurons" and c["allow_neurons"]:
                 world_neuron_delta -= int(self.config.neuron_step)
@@ -901,7 +929,8 @@ class OfflineArchitecture:
             )
             if action not in {
                 "add_intermediate_layer", "prune_intermediate_layer",
-                "add_neurons", "prune_neurons",
+                "add_neurons", "prune_neurons", "add_world_generative_layer",
+                "add_neurons_and_world_layer", "add_policy_neurons",
             }:
                 structural_applied = structural_applied or bool(ok)
 
@@ -917,7 +946,7 @@ class OfflineArchitecture:
                 skipped.extend({**item, "reason": f"declaration_validation_failed: {exc}"} for item in applied)
                 return {"applied": [], "skipped": skipped}
 
-        if world_neuron_delta:
+        if world_neuron_delta or world_add_layer or world_policy_delta:
             # Do not allow the shared representation to collapse below its
             # configured minimum; the most restrictive target limit applies.
             limits = [
@@ -940,17 +969,25 @@ class OfflineArchitecture:
                         min(int(x["max_neurons"]) for x in limits),
                     )
                     delta = max(min_dim - old_dim, min(max_dim - old_dim, world_neuron_delta))
-                    if delta:
+                    if delta or world_add_layer or world_policy_delta:
                         if delta < 0:
                             seen_models = set()
                             for module in old_modules:
                                 if id(module) not in seen_models:
                                     seen_models.add(id(module))
                                     self._reorder_world_generative_model_channels(module)
-                        self._replace_world_generative_model(delta=delta)
+                        self._replace_world_generative_model(
+                            delta=delta, add_layer=world_add_layer,
+                            policy_hidden_delta=world_policy_delta,
+                        )
                         trainer = getattr(self.agent, "_offline_trainer", None)
                         if trainer is not None:
                             trainer.invalidate_optimizer()
+            elif world_policy_delta:
+                self._replace_world_generative_model(policy_hidden_delta=world_policy_delta)
+                trainer = getattr(self.agent, "_offline_trainer", None)
+                if trainer is not None:
+                    trainer.invalidate_optimizer()
         rebuilt = False
         if structural_applied:
             self._rebuild(D, gf)

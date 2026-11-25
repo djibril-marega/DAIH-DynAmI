@@ -756,45 +756,62 @@ application-specific trainer or an external model-accuracy estimate.
 
 ### Phase III — Architectural Restructuring
 
-Phase III performs one structural intervention per offline call. It
-evaluates candidate removals against the current model and a test batch.
+Phase III is a persistent two-part process. Its controller state is stored
+with the offline trainer so that an interrupted run resumes at the same
+structural level.
 
--   A component whose removal causes a sufficiently large loss of
-    explanatory performance is retained.
--   A removal that does not exceed the candidate's precision threshold
-    can be accepted.
--   After deletion candidates have been evaluated, the controller can
-    test capacity additions from retained structural families.
--   A capacity addition is accepted only when it produces an improvement
-    greater than the configured global precision.
+**A. Simultaneous cleanup**
 
-After the structural intervention, whether it is accepted, rejected, or
-not applicable, the next offline step returns to Phases I and II. An
-accepted structural change also restarts the learning cycle. This ensures
-that the modified architecture is relearned before another structural
-intervention is considered.
+DAIH first builds the complete set of currently eligible deletion mutations:
+obsolete weights, neurons, intermediate layers, coordinates, under-states,
+states, and hierarchy layers. The mutations are evaluated from the same
+pre-mutation architecture and submitted to `OfflineArchitecture.apply` in
+one transaction. The resulting architecture is checked against validation
+free energy. If the collective mutation is rejected, the original agent
+snapshot is restored. If it is accepted, Phases I and II are restarted
+before expansion begins.
 
-## Architecture Adaptation
+**B. Capacity relaunch**
 
-The offline architecture manager can evaluate and modify several
-structural dimensions:
+Expansion is performed in ordered families. Each candidate starts from an
+identical snapshot, receives a short offline adaptation on observation
+memory (and policy adaptation only through transition memory), and is
+evaluated on the validation observations. The candidate with the greatest
+positive validation-F gain is committed. Candidate gradients are measured
+on newly introduced parameter regions and filtered using a moving gradient
+reference (`structural_gradient_beta`, `structural_gradient_min`).
 
--   shared WorldGenerativeModel capacity, including neuron/channel changes and
-    intermediate layers;
--   state-local generalized coordinates;
--   state-local under-states;
--   state additions and removals;
--   hierarchical-layer additions and removals.
+The order is deliberate:
 
-The manager uses the current posterior means and variances to initialize
-the rebuilt model after a structural mutation. It validates configured
-constraints and rebuilds the agent through its model initialization
-path.
+1. World Generative Model capacity: add a neuron, add a one-neuron
+   intermediate layer, add both together, or expand policy hidden capacity.
+2. Generalized coordinates.
+3. Under-states.
+4. States.
+5. Hierarchy layers.
 
-Mutations can be constrained globally with `graph_constraints` and
-locally for each state with `state_constraints`. These settings allow
-the application to protect states or structural dimensions that must
-not be modified.
+The generative family, including policy capacity, must be exhausted before
+the state representation is expanded. Within a family, a committed
+candidate becomes the new baseline; Phases I and II run again before the
+next structural search. If no candidate produces a validation-F gain above
+`global_precision` and a sufficient new-parameter gradient, DAIH advances
+to the next family. When every family is exhausted, Phase III is complete.
+
+New coordinates and states are initialized through the normal model
+rebuild path. Historical observation/transition records are not fabricated
+for them: incompatible historical components remain unavailable, while
+the new elements participate in current inference and can adapt through
+the free-energy objective.
+
+### Adaptive Learning Rates
+
+The offline optimizer uses separate parameter groups for leaf layers of
+the shared World Generative Models and for policy-generator layers. Each
+group has a persistent learning rate in the offline controller state.
+Existing groups retain their rates when the optimizer is rebuilt; newly
+created groups receive the configured default rate and can subsequently
+adapt independently. Policy groups use `policy_learning_rate` when set,
+otherwise the base rate scaled by `agent.lr_policies`.
 
 ## Compatibility After Restructuring
 
@@ -925,6 +942,8 @@ The principal `OfflineConfig` defaults include:
 | `inference_memory_capacity` | `256` | Maximum retained observation records. |
 | `transition_memory_capacity` | `256` | Maximum retained transition records. |
 | `enable_structural_phase` | `True` | Enables Phase III. |
+| `structural_gradient_beta` | `0.9` | EMA coefficient for the Phase-III candidate-gradient reference. |
+| `structural_gradient_min` | `1e-10` | Minimum new-parameter gradient magnitude for a candidate to qualify. |
 | `weights_only` | `False` | Disables architecture/phase mutations when enabled. |
 
 See the `OfflineConfig` dataclass in

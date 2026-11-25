@@ -117,6 +117,8 @@ class OfflineConfig:
     temporal_loss_weight: float = 1.0
     policy_precision_min: float = 1e-9
     structural_evaluation_limit: int = 1
+    structural_gradient_beta: float = 0.9
+    structural_gradient_min: float = 1e-10
     enable_structural_phase: bool = True
 
     # Persistent observations collected during online inference.
@@ -888,18 +890,70 @@ class _LegacyOfflineTrainer:
         return parameters
 
     def _parameter_groups(self):
-        """World-model parameters only; policy generators have their own loss."""
+        """Create independent optimizer groups for each trainable module/layer.
+
+        Shared parameters are registered once. Group learning rates are persisted
+        by stable module path, so a newly-created layer receives its own rate
+        without overwriting rates belonging to existing layers.
+        """
         policy_ids = {id(parameter) for parameter in self._policy_parameters()}
-        parameters, seen = [], set()
-        for module in self._unique_modules():
-            for parameter in module.parameters():
-                if (parameter.requires_grad and id(parameter) not in seen
-                        and id(parameter) not in policy_ids):
-                    parameters.append(parameter)
-                    seen.add(id(parameter))
-        if not parameters:
-            return []
-        return [{"params": parameters, "lr": self.config.learning_rate}]
+        groups, seen = [], set()
+        rates = getattr(self, "_element_learning_rates", {})
+        for root_index, root in enumerate(self._unique_modules()):
+            for module_name, module in root.named_modules():
+                params = [
+                    parameter for parameter in module.parameters(recurse=False)
+                    if parameter.requires_grad and id(parameter) not in seen
+                    and id(parameter) not in policy_ids
+                ]
+                if not params:
+                    continue
+                seen.update(id(parameter) for parameter in params)
+                name = f"world:{root_index}:{module_name or '<root>'}"
+                lr = float(rates.setdefault(name, self.config.learning_rate))
+                groups.append({
+                    "params": params, "lr": lr, "group_name": name,
+                    "weight_decay": self.config.weight_decay,
+                })
+        return groups
+
+    def _policy_parameter_groups(self):
+        """Independent learning-rate groups for policy-generator layers."""
+        groups, seen = [], set()
+        rates = getattr(self, "_element_learning_rates", {})
+        for root_index, root in enumerate(self._unique_modules()):
+            policy_roots = []
+            generator = getattr(root, "policy_generator", None)
+            if isinstance(generator, nn.Module):
+                policy_roots.append(("policy", generator))
+            local_modules = getattr(root, "_local_modules", None)
+            if local_modules is not None:
+                policy_roots.extend(
+                    (f"local:{key}", module) for key, module in local_modules.items()
+                    if key.endswith(":p") and isinstance(module, nn.Module)
+                )
+            for policy_name, policy_root in policy_roots:
+                for module_name, module in policy_root.named_modules():
+                    params = [
+                        p for p in module.parameters(recurse=False)
+                        if p.requires_grad and id(p) not in seen
+                    ]
+                    if not params:
+                        continue
+                    seen.update(id(p) for p in params)
+                    name = f"policy:{root_index}:{policy_name}:{module_name or '<root>'}"
+                    default_lr = (
+                        float(self.config.policy_learning_rate)
+                        if self.config.policy_learning_rate is not None
+                        else float(self.config.learning_rate) * float(self.agent.lr_policies)
+                    )
+                    groups.append({
+                        "params": params,
+                        "lr": float(rates.setdefault(name, default_lr)),
+                        "group_name": name,
+                        "weight_decay": self.config.weight_decay,
+                    })
+        return groups
 
     def _allowed_states_for_frame(self, frame):
         """None means all current states; a set is a per-observation compatibility mask."""
@@ -984,9 +1038,11 @@ class _LegacyOfflineTrainer:
             )
             self._optimizer_signature = signature
             if self._pending_optimizer_state is not None:
-                # A checkpoint can restore Adam moments after the model and
-                # its modules have been reconstructed.
-                self._optimizer.load_state_dict(self._pending_optimizer_state)
+                # Layer-wise groups can differ after architectural changes.
+                try:
+                    self._optimizer.load_state_dict(self._pending_optimizer_state)
+                except (ValueError, KeyError):
+                    pass
                 self._pending_optimizer_state = None
         else:
             # Keep Adam's moments, while honoring live learning-rate changes.
@@ -1198,28 +1254,27 @@ class _LegacyOfflineTrainer:
         return inputs
 
     def _optimize_policy(self, observations: dict):
-        parameters = self._policy_parameters()
+        groups = self._policy_parameter_groups()
+        parameters = [p for group in groups for p in group["params"]]
         if not parameters:
             return {"updated": False, "loss": None, "parameters": 0, "candidates": 0}
 
-        signature = tuple(id(parameter) for parameter in parameters)
-        lr = (
-            float(self.config.policy_learning_rate)
-            if self.config.policy_learning_rate is not None
-            else float(self.config.learning_rate) * float(self.agent.lr_policies)
-        )
+        signature = tuple(tuple(id(p) for p in group["params"]) for group in groups)
         if self._policy_optimizer is None or signature != self._policy_optimizer_signature:
             self._policy_optimizer = torch.optim.AdamW(
-                parameters, lr=lr, weight_decay=self.config.weight_decay
+                groups, weight_decay=self.config.weight_decay
             )
             self._policy_optimizer_signature = signature
             if self._pending_policy_optimizer_state is not None:
-                self._policy_optimizer.load_state_dict(self._pending_policy_optimizer_state)
+                try:
+                    self._policy_optimizer.load_state_dict(self._pending_policy_optimizer_state)
+                except (ValueError, KeyError):
+                    pass
                 self._pending_policy_optimizer_state = None
         else:
-            for group in self._policy_optimizer.param_groups:
-                group["lr"] = lr
-                group["weight_decay"] = self.config.weight_decay
+            for optimizer_group, parameter_group in zip(self._policy_optimizer.param_groups, groups):
+                optimizer_group["lr"] = parameter_group["lr"]
+                optimizer_group["weight_decay"] = self.config.weight_decay
 
         self._policy_optimizer.zero_grad(set_to_none=True)
         policy_inputs = self._policy_inputs_from_observations(observations)
@@ -2277,6 +2332,11 @@ class OfflineTrainer(_LegacyOfflineTrainer):
         self._last_observation_state_scores = {}
         self._temporal_surprise_trace = []
         self._observation_compatibility = {}
+        self._element_learning_rates = {}
+        self._phase3_stage = "cleanup"
+        self._phase3_candidates = []
+        self._phase3_level = "generative"
+        self._structural_gradient_ema = None
 
     def _validate_config(self):
         super()._validate_config()
@@ -2298,6 +2358,10 @@ class OfflineTrainer(_LegacyOfflineTrainer):
             raise ValueError("inference_memory_old_fraction must be in [0, 1).")
         if self.config.temporal_precision is not None and float(self.config.temporal_precision) <= 0:
             raise ValueError("temporal_precision must be strictly positive when provided.")
+        if not 0.0 <= float(self.config.structural_gradient_beta) < 1.0:
+            raise ValueError("structural_gradient_beta must be in [0, 1).")
+        if float(self.config.structural_gradient_min) < 0:
+            raise ValueError("structural_gradient_min must be non-negative.")
 
     def state_dict(self) -> dict:
         state = super().state_dict()
@@ -2317,6 +2381,11 @@ class OfflineTrainer(_LegacyOfflineTrainer):
             "macro_cycles": self._macro_cycles,
             "last_temporal_loss": self._last_temporal_loss,
             "last_replay_info": deepcopy(self._last_replay_info),
+            "element_learning_rates": deepcopy(self._element_learning_rates),
+            "phase3_stage": self._phase3_stage,
+            "phase3_candidates": deepcopy(self._phase3_candidates),
+            "phase3_level": self._phase3_level,
+            "structural_gradient_ema": self._structural_gradient_ema,
         }
         return state
 
@@ -2343,6 +2412,13 @@ class OfflineTrainer(_LegacyOfflineTrainer):
         self._macro_cycles = int(macro.get("macro_cycles", 0))
         self._last_temporal_loss = macro.get("last_temporal_loss")
         self._last_replay_info = deepcopy(macro.get("last_replay_info", {"loaded": 0, "new": 0, "total": 0}))
+        self._element_learning_rates = {
+            str(k): float(v) for k, v in macro.get("element_learning_rates", {}).items()
+        }
+        self._phase3_stage = str(macro.get("phase3_stage", "cleanup"))
+        self._phase3_candidates = deepcopy(macro.get("phase3_candidates", []))
+        self._phase3_level = str(macro.get("phase3_level", "generative"))
+        self._structural_gradient_ema = macro.get("structural_gradient_ema")
 
     @staticmethod
     def _scalar(value, default=0.0) -> float:
@@ -3044,7 +3120,12 @@ class OfflineTrainer(_LegacyOfflineTrainer):
                     candidates.append({"action": "prune_intermediate_layer", "target": state,
                                        "kind": "layer"})
         if states:
-            candidates.insert(0, {"action": "prune_neurons", "target": states[0], "kind": "neuron"})
+            # Weight pruning is global over shared generative modules. It is
+            # represented once, then participates in the same cleanup batch.
+            candidates.insert(0, {"action": "prune_obsolete_weights",
+                                  "target": states[0], "kind": "weight"})
+            candidates.insert(1, {"action": "prune_neurons",
+                                  "target": states[0], "kind": "neuron"})
         return candidates
 
     def _snapshot_agent_for_trial(self):
@@ -3140,124 +3221,226 @@ class OfflineTrainer(_LegacyOfflineTrainer):
         self._macro_cycles += 1
         self.invalidate_optimizer()
 
-    def _structural_step(self, test_frames):
-        if not self._structural_candidates:
-            self._structural_candidates = self._candidate_structures()
-            self._structural_cursor = 0
-            self._retained_candidates = []
-            self._creation_cursor = 0
+    def _phase3_expansion_candidates(self):
+        """Generate the next ordered family of structural expansion trials."""
+        architecture = OfflineArchitecture(self.agent, self.config)
+        states = [name for name, node in self.agent.navigator.graph.items()
+                  if isinstance(node, dict) and node.get("type") == "state"]
+        if not states:
+            return []
+        if self._phase3_level == "generative":
+            target = states[0]
+            candidates = [
+                {"action": "add_neurons", "target": target, "kind": "neuron"},
+                {"action": "add_world_generative_layer", "target": target, "kind": "world_layer"},
+                {"action": "add_neurons_and_world_layer", "target": target, "kind": "combined"},
+            ]
+            if self.config.train_policy and self._load_transition_memory():
+                candidates.append({"action": "add_policy_neurons", "target": target, "kind": "policy"})
+            return candidates
+        candidates = []
+        for state in states:
+            c = architecture._constraint(state)
+            if self._phase3_level == "coordinates" and c["allow_coordinates"]:
+                candidates.append({"action": "add_generalized_coordinate", "target": state, "kind": "coordinate"})
+            elif self._phase3_level == "under_states" and c["allow_under_state"]:
+                candidates.append({"action": "add_under_state", "target": state, "kind": "under_state"})
+            elif self._phase3_level == "states" and architecture._graph_constraint()["allow_state_addition"]:
+                candidates.append({"action": "add_state", "target": state, "kind": "state"})
+            elif self._phase3_level == "hierarchy" and c["allow_hierarchy_addition"]:
+                candidates.append({"action": "add_hierarchy_layer", "target": state, "kind": "hierarchy"})
+        return candidates
 
-        if self._structural_cursor < len(self._structural_candidates):
-            candidate = deepcopy(self._structural_candidates[self._structural_cursor])
-            self._structural_cursor += 1
-            before_signature = self._structure_signature()
-            snapshot = self._snapshot_agent_for_trial()
-            before_global, before_metrics = self._evaluate_current_agent(test_frames)
-            before = self._candidate_free_energy(candidate, before_metrics, before_global)
-            result = self._apply_one_structure(candidate)
-            if not result.get("applied"):
-                after_signature = self._structure_signature()
-                diff = self._structure_diff(before_signature, after_signature)
-                record = {
-                    "candidate": candidate, "action": candidate.get("action"),
-                    "target": candidate.get("target"), "accepted": False,
-                    "element_added": None, "element_removed": None,
-                    "structure_changed": before_signature != after_signature,
-                    "structure_diff": diff, "reason": result.get("skipped", []),
-                    "F_before": before, "F_after": before,
-                    "architecture_result": result,
-                    "outcome": "not_applicable",
-                }
-                self._structural_log.append(record)
-                return record
+    def _advance_phase3_level(self):
+        levels = ["generative", "coordinates", "under_states", "states", "hierarchy"]
+        index = levels.index(self._phase3_level)
+        self._phase3_level = levels[index + 1] if index + 1 < len(levels) else "complete"
+        self._phase3_candidates = []
 
-            after_global, after_metrics = self._evaluate_current_agent(test_frames)
-            after = self._candidate_free_energy(candidate, after_metrics, after_global)
-            delta = after - before
-            threshold = 1.0 / self._precision_for_candidate(candidate)
-            useful = delta > threshold
-            if useful:
-                self._restore_agent_trial(snapshot)
-                self._retained_candidates.append(candidate)
-                outcome = "retained_component"
-                accepted = False
-            else:
-                self.invalidate_optimizer()
-                outcome = "component_removed_restart_learning"
-                accepted = True
-                self._restart_learning_cycle()
+    def _phase3_train_candidate(self, frames):
+        """Short isolated adaptation of a candidate on offline memories."""
+        contexts = self._build_belief_contexts(frames, self._snapshot_beliefs())
+        selected, _ = self._select_surprising_contexts(contexts)
+        world_result = self._optimize_world_generative_model(selected)
+        policy_results = []
+        if self.config.train_policy and self._load_transition_memory():
+            policy_results.append(self._optimize_policy({}))
+        return {"world_training": world_result,
+                "policy_training": self._mean_policy_results(policy_results)}
 
-            after_signature = self._structure_signature()
-            diff = self._structure_diff(before_signature, after_signature)
-            changed = before_signature != after_signature
-            removed = ({"kind": candidate.get("kind"), "target": candidate.get("target")}
-                       if accepted and changed else None)
-            record = {
-                "candidate": candidate, "action": candidate.get("action"),
-                "target": candidate.get("target"), "accepted": accepted,
-                "element_added": None, "element_removed": removed,
-                "structure_changed": changed, "structure_diff": diff,
-                "outcome": outcome, "F_before": before,
-                "F_after": after if not useful else before,
-                "delta_F": delta, "precision": self._precision_for_candidate(candidate),
-                "threshold": threshold, "architecture_result": result,
-            }
-            self._structural_log.append(record)
-            return record
-
-        # Once all deletion candidates have been evaluated, try one addition.
-        if self._retained_candidates and self._creation_cursor < len(self._retained_candidates):
-            source = self._retained_candidates[self._creation_cursor]
-            self._creation_cursor += 1
-            add_actions = {
-                "neuron": "add_neurons", "coordinate": "add_generalized_coordinate",
-                "under_state": "add_under_state", "state": "add_state",
-                "hierarchy": "add_hierarchy_layer", "layer": "add_intermediate_layer",
-            }
-            creation = {"action": add_actions[source["kind"]],
-                        "target": source["target"], "kind": source["kind"]}
+    def _structural_step(self, train_frames, test_frames):
+        """Phase III: simultaneous cleanup followed by ordered expansion search."""
+        # A. Cleanup: evaluate all deletions against one common architecture,
+        # then apply the complete deletion set atomically.
+        if self._phase3_stage == "cleanup":
+            unique = {}
+            for candidate in self._candidate_structures():
+                key = (candidate.get("action"), candidate.get("target"), candidate.get("kind"))
+                unique[key] = candidate
+            mutations = list(unique.values())
             before_signature = self._structure_signature()
             snapshot = self._snapshot_agent_for_trial()
             before, _ = self._evaluate_current_agent(test_frames)
-            result = self._apply_one_structure(creation)
-            if result.get("applied"):
-                after, _ = self._evaluate_current_agent(test_frames)
-                gain = before - after
-                success = gain > self._global_precision()
-            else:
-                after, gain, success = before, 0.0, False
-            if success:
-                self.invalidate_optimizer()
-                outcome = "capacity_added_restart_learning"
-                self._restart_learning_cycle()
-            else:
+            result = OfflineArchitecture(self.agent, self.config).apply(mutations) if mutations else {
+                "applied": [], "skipped": []}
+            after, _ = self._evaluate_current_agent(test_frames)
+            accepted = bool(result.get("applied")) and after <= before + self._global_precision()
+            if not accepted:
                 self._restore_agent_trial(snapshot)
-                outcome = "capacity_addition_rejected"
-            after_signature = self._structure_signature()
-            diff = self._structure_diff(before_signature, after_signature)
-            changed = before_signature != after_signature
-            added = ({"kind": creation.get("kind"), "target": creation.get("target")}
-                     if success and changed else None)
+                after = before
+                self._phase3_stage = "expand"
+                self._phase3_level = "generative"
+            else:
+                self.invalidate_optimizer()
+                self._restart_learning_cycle()
+                self._phase3_stage = "expand"
+                self._phase3_level = "generative"
+                self._phase3_candidates = []
             record = {
-                "candidate": creation, "action": creation.get("action"),
-                "target": creation.get("target"), "accepted": success,
-                "element_added": added, "element_removed": None,
-                "structure_changed": changed, "structure_diff": diff,
-                "outcome": outcome, "F_before": before,
-                "F_after": after if success else before,
-                "delta_F": before - after, "global_precision": self._global_precision(),
-                "architecture_result": result,
+                "stage": "cleanup", "accepted": accepted,
+                "candidate_count": len(mutations),
+                "applied": result.get("applied", []), "skipped": result.get("skipped", []),
+                "F_before": before, "F_after": after,
+                "structure_diff": self._structure_diff(before_signature, self._structure_signature()),
+                "outcome": "simultaneous_cleanup_applied" if accepted else "cleanup_rejected_or_empty",
             }
             self._structural_log.append(record)
             return record
 
-        record = {
-            "candidate": None, "action": None, "target": None,
-            "accepted": False, "element_added": None, "element_removed": None,
-            "structure_changed": False,
-            "outcome": ("all_capacity_additions_rejected" if self._retained_candidates
-                        else "no_structural_candidate_available"),
-        }
+        if self._phase3_level == "complete":
+            self._phase3_stage = "complete"
+            record = {"stage": "complete", "accepted": False,
+                      "outcome": "no_remaining_architectural_improvement"}
+            self._structural_log.append(record)
+            return record
+
+        if not self._phase3_candidates:
+            self._phase3_candidates = self._phase3_expansion_candidates()
+        if not self._phase3_candidates:
+            previous = self._phase3_level
+            self._advance_phase3_level()
+            record = {"stage": "advance", "level": previous, "next_level": self._phase3_level,
+                      "accepted": False, "outcome": "no_candidate_in_level"}
+            self._structural_log.append(record)
+            return record
+
+        # B. Relance: every candidate starts from an identical snapshot. Each
+        # trial receives its own adaptation, then validation F decides utility.
+        baseline_snapshot = self._snapshot_agent_for_trial()
+        # The unchanged architecture receives the same adaptation budget as
+        # every candidate. This supplies a fair baseline for both F and policy
+        # expected-free-energy loss.
+        baseline_training = self._phase3_train_candidate(train_frames)
+        baseline_F, _ = self._evaluate_current_agent(test_frames)
+        baseline_policy_loss = baseline_training.get("policy_training", {}).get("loss")
+        self._restore_agent_trial(baseline_snapshot)
+        baseline_parameter_shapes = {}
+        for root_index, module in enumerate(self._unique_modules()):
+            for parameter_name, parameter in module.named_parameters():
+                baseline_parameter_shapes[(root_index, parameter_name)] = tuple(parameter.shape)
+        trials = []
+        for candidate in self._phase3_candidates:
+            self._restore_agent_trial(baseline_snapshot)
+            before_signature = self._structure_signature()
+            result = OfflineArchitecture(self.agent, self.config).apply([candidate])
+            if not result.get("applied"):
+                trials.append({"candidate": candidate, "applied": False,
+                               "reason": result.get("skipped", []), "gain": float("-inf")})
+                continue
+            training = self._phase3_train_candidate(train_frames)
+            candidate_F, _ = self._evaluate_current_agent(test_frames)
+            # Measure only newly introduced parameter regions. Existing
+            # overlapping weights do not make a candidate appear influential.
+            grad_norm_sq = 0.0
+            for root_index, module in enumerate(self._unique_modules()):
+                for parameter_name, parameter in module.named_parameters():
+                    gradient = parameter.grad
+                    if gradient is None or not torch.isfinite(gradient).all():
+                        continue
+                    old_shape = baseline_parameter_shapes.get((root_index, parameter_name))
+                    if old_shape is None:
+                        contribution = gradient.detach()
+                    elif tuple(parameter.shape) == old_shape:
+                        continue
+                    else:
+                        mask = torch.ones_like(gradient, dtype=torch.bool)
+                        overlap = tuple(slice(0, min(a, b)) for a, b in zip(old_shape, parameter.shape))
+                        mask[overlap] = False
+                        contribution = gradient.detach()[mask]
+                    if contribution.numel():
+                        grad_norm_sq += float(torch.sum(contribution.float() ** 2).cpu())
+            grad_norm = math.sqrt(grad_norm_sq)
+            policy_loss = training.get("policy_training", {}).get("loss")
+            policy_gain = 0.0
+            if baseline_policy_loss is not None and policy_loss is not None:
+                policy_gain = float(baseline_policy_loss) - float(policy_loss)
+            world_gain = float(baseline_F) - float(candidate_F)
+            combined_gain = world_gain + float(self.config.policy_efe_weight) * policy_gain
+            trials.append({
+                "candidate": candidate, "applied": True,
+                "gain": combined_gain, "world_gain": world_gain,
+                "policy_gain": policy_gain, "policy_loss": policy_loss,
+                "F": float(candidate_F), "gradient_norm": grad_norm,
+                "training": training,
+                "structure_diff": self._structure_diff(before_signature, self._structure_signature()),
+            })
+
+        self._restore_agent_trial(baseline_snapshot)
+        gradient_values = [trial.get("gradient_norm", 0.0) for trial in trials
+                           if trial.get("applied") and math.isfinite(trial.get("gradient_norm", 0.0))]
+        if gradient_values:
+            observed_gradient = sum(gradient_values) / len(gradient_values)
+            beta = float(self.config.structural_gradient_beta)
+            self._structural_gradient_ema = (
+                observed_gradient if self._structural_gradient_ema is None else
+                beta * float(self._structural_gradient_ema) + (1.0 - beta) * observed_gradient
+            )
+        gradient_threshold = max(
+            float(self.config.structural_gradient_min),
+            float(self._structural_gradient_ema or 0.0),
+        )
+        viable = [trial for trial in trials if trial.get("applied") and
+                  trial.get("gain", 0.0) > self._global_precision() and
+                  trial.get("gradient_norm", 0.0) >= gradient_threshold and
+                  trial.get("gradient_norm", 0.0) > 0.0]
+        winner = max(viable, key=lambda item: item["gain"]) if viable else None
+        if winner is not None:
+            result = OfflineArchitecture(self.agent, self.config).apply([winner["candidate"]])
+            if result.get("applied"):
+                training = self._phase3_train_candidate(train_frames)
+                self.invalidate_optimizer()
+                record = {
+                    "stage": "expansion", "level": self._phase3_level,
+                    "candidate": winner["candidate"], "accepted": True,
+                    "gain": winner["gain"], "gradient_norm": winner["gradient_norm"],
+                    "gradient_threshold": gradient_threshold,
+                    "trials": trials, "training": training, "architecture_result": result,
+                    "outcome": "best_candidate_committed_restart_learning",
+                }
+                self._structural_log.append(record)
+                # The winning architecture is now the baseline for another
+                # search in this same family after phases I and II have run.
+                self._phase3_candidates = []
+                self._restart_learning_cycle()
+                self._phase3_stage = "expand"
+                self._phase3_level = record["level"]
+                return record
+
+        previous = self._phase3_level
+        if (previous == "generative" and self.config.train_policy
+                and not self._load_transition_memory()):
+            # Policy capacity cannot be judged without transition experience.
+            # Do not silently declare the generative family exhausted.
+            self._phase3_candidates = []
+            record = {"stage": "expansion", "level": previous, "accepted": False,
+                      "outcome": "waiting_for_policy_transition_memory",
+                      "trials": trials}
+            self._structural_log.append(record)
+            return record
+        self._advance_phase3_level()
+        record = {"stage": "expansion", "level": previous, "accepted": False,
+                  "trials": trials, "next_level": self._phase3_level,
+                  "outcome": "family_exhausted_without_improvement"}
         self._structural_log.append(record)
         return record
 
@@ -3393,22 +3576,14 @@ class OfflineTrainer(_LegacyOfflineTrainer):
                 "most_surprising_transitions": temporal_surprises[:max(1, self.top_k)],
             }
         else:
-            # PHASE III — perform one structural operation only. The structural
-            # phase is a single intervention between two learning cycles, not
-            # a phase that may consume the remaining offline steps.
+            # PHASE III — persistent restructuring controller. It advances
+            # through cleanup and the ordered expansion families over multiple
+            # offline calls. Only an accepted structural change restarts I/II.
             F_after, metrics_after = self._evaluate(test_contexts)
             structural_phase = self.macro_phase
-            structural = self._structural_step(test_frames)
+            structural = self._structural_step(frames, test_frames)
             if structural.get("accepted"):
                 F_after, metrics_after = self._evaluate_current_agent(test_frames)
-
-            # Phase III is a single structural intervention per trigger.
-            # Whether the candidate is accepted, rejected, or not applicable,
-            # always return to phases I and II on the next offline step.
-            # Accepted mutations already restart the cycle inside
-            # _structural_step; avoid restarting/incrementing the cycle twice.
-            if self.macro_phase == 3:
-                self._restart_learning_cycle()
 
             phase_info = {
                 "macro_phase": structural_phase,

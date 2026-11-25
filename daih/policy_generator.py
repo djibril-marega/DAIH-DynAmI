@@ -140,7 +140,7 @@ class PolicyGenerator(nn.Module):
             else float(temperature)
         )
 
-        tau = torch.exp(torch.tensor(tau))
+        tau = torch.clamp(torch.exp(torch.tensor(tau)), max=5)
         if not math.isfinite(tau) or tau <= 0:
             raise ValueError(f"tau must be positive and finite. This current value is: ( {tau})")
 
