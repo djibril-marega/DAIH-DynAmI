@@ -696,7 +696,7 @@ class Agent_DAIH:
                 )
                 self.inputs_map[action_group[0]] = new_action_oh
                 self.inputs_map[f"error_{state_name}"] = (
-                    self.pi_p[state_name].detach().item()
+                    1/self.pi_p[state_name].detach().item()
                 )
 
                 first_action = policy_values.policy.policy[0][0]
