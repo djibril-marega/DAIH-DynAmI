@@ -117,6 +117,7 @@ class OfflineConfig:
     temporal_loss_weight: float = 1.0
     policy_precision_min: float = 1e-9
     structural_evaluation_limit: int = 1
+    structural_max_expansions_per_level: int = 3
     structural_gradient_beta: float = 0.9
     structural_gradient_min: float = 1e-10
     enable_structural_phase: bool = True
@@ -2336,6 +2337,7 @@ class OfflineTrainer(_LegacyOfflineTrainer):
         self._phase3_stage = "cleanup"
         self._phase3_candidates = []
         self._phase3_level = "generative"
+        self._phase3_level_expansions = {}
         self._structural_gradient_ema = None
 
     def _validate_config(self):
@@ -2360,6 +2362,8 @@ class OfflineTrainer(_LegacyOfflineTrainer):
             raise ValueError("temporal_precision must be strictly positive when provided.")
         if not 0.0 <= float(self.config.structural_gradient_beta) < 1.0:
             raise ValueError("structural_gradient_beta must be in [0, 1).")
+        if int(self.config.structural_max_expansions_per_level) < 1:
+            raise ValueError("structural_max_expansions_per_level must be >= 1.")
         if float(self.config.structural_gradient_min) < 0:
             raise ValueError("structural_gradient_min must be non-negative.")
 
@@ -2385,6 +2389,7 @@ class OfflineTrainer(_LegacyOfflineTrainer):
             "phase3_stage": self._phase3_stage,
             "phase3_candidates": deepcopy(self._phase3_candidates),
             "phase3_level": self._phase3_level,
+            "phase3_level_expansions": deepcopy(self._phase3_level_expansions),
             "structural_gradient_ema": self._structural_gradient_ema,
         }
         return state
@@ -2418,6 +2423,9 @@ class OfflineTrainer(_LegacyOfflineTrainer):
         self._phase3_stage = str(macro.get("phase3_stage", "cleanup"))
         self._phase3_candidates = deepcopy(macro.get("phase3_candidates", []))
         self._phase3_level = str(macro.get("phase3_level", "generative"))
+        self._phase3_level_expansions = {
+            str(k): int(v) for k, v in macro.get("phase3_level_expansions", {}).items()
+        }
         self._structural_gradient_ema = macro.get("structural_gradient_ema")
 
     @staticmethod
@@ -3290,12 +3298,14 @@ class OfflineTrainer(_LegacyOfflineTrainer):
                 after = before
                 self._phase3_stage = "expand"
                 self._phase3_level = "generative"
+                self._phase3_level_expansions = {}
             else:
                 self.invalidate_optimizer()
                 self._restart_learning_cycle()
                 self._phase3_stage = "expand"
                 self._phase3_level = "generative"
                 self._phase3_candidates = []
+                self._phase3_level_expansions = {}
             record = {
                 "stage": "cleanup", "accepted": accepted,
                 "candidate_count": len(mutations),
@@ -3308,10 +3318,18 @@ class OfflineTrainer(_LegacyOfflineTrainer):
             return record
 
         if self._phase3_level == "complete":
-            self._phase3_stage = "complete"
+            # Exhausting every architectural family must never leave the
+            # controller in Phase III. Return to I/II and prepare a fresh
+            # search pass for a later convergence/stagnation trigger.
             record = {"stage": "complete", "accepted": False,
-                      "outcome": "no_remaining_architectural_improvement"}
+                      "outcome": "all_architectural_levels_exhausted_restart_learning",
+                      "next_macro_phase": 1}
             self._structural_log.append(record)
+            self._phase3_stage = "cleanup"
+            self._phase3_level = "generative"
+            self._phase3_candidates = []
+            self._phase3_level_expansions = {}
+            self._restart_learning_cycle()
             return record
 
         if not self._phase3_candidates:
@@ -3418,25 +3436,29 @@ class OfflineTrainer(_LegacyOfflineTrainer):
                     "outcome": "best_candidate_committed_restart_learning",
                 }
                 self._structural_log.append(record)
-                # The winning architecture is now the baseline for another
-                # search in this same family after phases I and II have run.
+                # Bound repeated growth within one architectural family. Each
+                # accepted mutation still gets a complete Phase I/II learning
+                # cycle before the next family/candidate is considered.
+                level = record["level"]
+                accepted_count = self._phase3_level_expansions.get(level, 0) + 1
+                self._phase3_level_expansions[level] = accepted_count
+                limit = int(self.config.structural_max_expansions_per_level)
                 self._phase3_candidates = []
+                if accepted_count >= limit:
+                    self._advance_phase3_level()
+                    record["level_expansions"] = accepted_count
+                    record["level_expansion_limit"] = limit
+                    record["next_level"] = self._phase3_level
+                    record["outcome"] = "family_expansion_limit_reached_restart_learning"
+                else:
+                    record["level_expansions"] = accepted_count
+                    record["level_expansion_limit"] = limit
+                    record["outcome"] = "best_candidate_committed_restart_learning"
                 self._restart_learning_cycle()
                 self._phase3_stage = "expand"
-                self._phase3_level = record["level"]
                 return record
 
         previous = self._phase3_level
-        if (previous == "generative" and self.config.train_policy
-                and not self._load_transition_memory()):
-            # Policy capacity cannot be judged without transition experience.
-            # Do not silently declare the generative family exhausted.
-            self._phase3_candidates = []
-            record = {"stage": "expansion", "level": previous, "accepted": False,
-                      "outcome": "waiting_for_policy_transition_memory",
-                      "trials": trials}
-            self._structural_log.append(record)
-            return record
         self._advance_phase3_level()
         record = {"stage": "expansion", "level": previous, "accepted": False,
                   "trials": trials, "next_level": self._phase3_level,
