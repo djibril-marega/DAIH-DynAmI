@@ -117,7 +117,8 @@ class OfflineConfig:
     temporal_loss_weight: float = 1.0
     policy_precision_min: float = 1e-9
     structural_evaluation_limit: int = 1
-    structural_max_expansions_per_level: int = 3
+    # Deprecated compatibility option: retained when loading older configs, but ignored.
+    structural_max_expansions_per_level: int | None = None
     structural_gradient_beta: float = 0.9
     structural_gradient_min: float = 1e-10
     enable_structural_phase: bool = True
@@ -1024,7 +1025,7 @@ class _LegacyOfflineTrainer:
             # free-energy function with operations lacking vmap rules.
             return [self.agent.free_energy(*items) for items in objective_inputs]
 
-    def _optimize_world_generative_model(self, observations: dict):
+    def _optimize_world_generative_model(self, observations: dict, *, apply_step: bool = True):
         groups = self._parameter_groups()
         if not groups:
             return {"updated": False, "loss": None, "parameters": 0}
@@ -1130,12 +1131,19 @@ class _LegacyOfflineTrainer:
             for parameter in group["params"]
             if parameter.grad is not None
         ]
-        if parameters:
+        gradient_norm = (
+            float(torch.sqrt(sum(torch.sum(parameter.grad.detach().float() ** 2)
+                                 for parameter in parameters)).cpu())
+            if parameters else 0.0
+        )
+        if parameters and apply_step:
             torch.nn.utils.clip_grad_norm_(parameters, self.config.gradient_clip)
             optimizer.step()
 
         return {
-            "updated": bool(parameters),
+            "updated": bool(parameters) and bool(apply_step),
+            "gradient_norm": finite_float(gradient_norm),
+            "gradient_probe": not apply_step,
             "loss": finite_float(total_loss_value),
             "parameters": sum(parameter.numel() for parameter in parameters),
             "vectorized_states": vectorized_state_count,
@@ -1254,7 +1262,7 @@ class _LegacyOfflineTrainer:
             inputs[group_name] = value
         return inputs
 
-    def _optimize_policy(self, observations: dict):
+    def _optimize_policy(self, observations: dict, *, apply_step: bool = True):
         groups = self._policy_parameter_groups()
         parameters = [p for group in groups for p in group["params"]]
         if not parameters:
@@ -1321,10 +1329,11 @@ class _LegacyOfflineTrainer:
                 )
                 if torch.isfinite(total) and total.requires_grad:
                     losses.append(total.reshape(()))
-                self._policy_baselines[state_name] = (
-                    float(self.config.policy_baseline_momentum) * float(baseline)
-                    + (1.0 - float(self.config.policy_baseline_momentum)) * float(g_posterior.item())
-                )
+                if apply_step:
+                    self._policy_baselines[state_name] = (
+                        float(self.config.policy_baseline_momentum) * float(baseline)
+                        + (1.0 - float(self.config.policy_baseline_momentum)) * float(g_posterior.item())
+                    )
                 diagnostics[state_name] = {
                     "G_prior": finite_float(g_prior.detach().item()),
                     "G_posterior": finite_float(g_posterior.item()),
@@ -1341,11 +1350,18 @@ class _LegacyOfflineTrainer:
         total_loss = torch.stack(losses).sum()
         total_loss.backward()
         active_parameters = [p for p in parameters if p.grad is not None]
-        if active_parameters:
+        gradient_norm = (
+            float(torch.sqrt(sum(torch.sum(p.grad.detach().float() ** 2)
+                                 for p in active_parameters)).cpu())
+            if active_parameters else 0.0
+        )
+        if active_parameters and apply_step:
             torch.nn.utils.clip_grad_norm_(active_parameters, self.config.gradient_clip)
             self._policy_optimizer.step()
         return {
-            "updated": bool(active_parameters),
+            "updated": bool(active_parameters) and bool(apply_step),
+            "gradient_norm": finite_float(gradient_norm),
+            "gradient_probe": not apply_step,
             "loss": finite_float(total_loss.detach().item()),
             "parameters": sum(p.numel() for p in active_parameters),
             "candidates": len(candidates),
@@ -2362,8 +2378,6 @@ class OfflineTrainer(_LegacyOfflineTrainer):
             raise ValueError("temporal_precision must be strictly positive when provided.")
         if not 0.0 <= float(self.config.structural_gradient_beta) < 1.0:
             raise ValueError("structural_gradient_beta must be in [0, 1).")
-        if int(self.config.structural_max_expansions_per_level) < 1:
-            raise ValueError("structural_max_expansions_per_level must be >= 1.")
         if float(self.config.structural_gradient_min) < 0:
             raise ValueError("structural_gradient_min must be non-negative.")
 
@@ -3276,6 +3290,45 @@ class OfflineTrainer(_LegacyOfflineTrainer):
         return {"world_training": world_result,
                 "policy_training": self._mean_policy_results(policy_results)}
 
+    def _new_parameter_gradient_norm(self, baseline_parameter_shapes):
+        """Norm of gradients restricted to parameter regions added by a candidate."""
+        squared_norm = 0.0
+        for root_index, module in enumerate(self._unique_modules()):
+            for parameter_name, parameter in module.named_parameters():
+                gradient = parameter.grad
+                if gradient is None or not torch.isfinite(gradient).all():
+                    continue
+                old_shape = baseline_parameter_shapes.get((root_index, parameter_name))
+                if old_shape is None:
+                    contribution = gradient.detach()
+                elif len(old_shape) != gradient.ndim:
+                    contribution = gradient.detach()
+                elif tuple(parameter.shape) == old_shape:
+                    continue
+                else:
+                    mask = torch.ones_like(gradient, dtype=torch.bool)
+                    overlap = tuple(slice(0, min(a, b)) for a, b in zip(old_shape, parameter.shape))
+                    mask[overlap] = False
+                    contribution = gradient.detach()[mask]
+                if contribution.numel():
+                    squared_norm += float(torch.sum(contribution.float() ** 2).cpu())
+        return math.sqrt(squared_norm)
+
+    def _phase3_probe_candidate(self, frames, baseline_parameter_shapes):
+        """Backpropagate once to measure new-parameter influence, without optimizer steps."""
+        contexts = self._build_belief_contexts(frames, self._snapshot_beliefs())
+        selected, _ = self._select_surprising_contexts(contexts)
+        world_probe = self._optimize_world_generative_model(selected, apply_step=False)
+        policy_probe = {"gradient_norm": 0.0, "updated": False}
+        if self.config.train_policy and self._load_transition_memory():
+            policy_probe = self._optimize_policy({}, apply_step=False)
+        gradient_norm = self._new_parameter_gradient_norm(baseline_parameter_shapes)
+        return {
+            "gradient_norm": finite_float(gradient_norm),
+            "world_probe": world_probe,
+            "policy_probe": policy_probe,
+        }
+
     def _structural_step(self, train_frames, test_frames):
         """Phase III: simultaneous cleanup followed by ordered expansion search."""
         # A. Cleanup: evaluate all deletions against one common architecture,
@@ -3356,56 +3409,24 @@ class OfflineTrainer(_LegacyOfflineTrainer):
         for root_index, module in enumerate(self._unique_modules()):
             for parameter_name, parameter in module.named_parameters():
                 baseline_parameter_shapes[(root_index, parameter_name)] = tuple(parameter.shape)
-        trials = []
+
+        # First pass: apply each candidate to the same untouched baseline and
+        # measure gradients only. No candidate optimizer is allowed to step.
+        probes = []
         for candidate in self._phase3_candidates:
             self._restore_agent_trial(baseline_snapshot)
-            before_signature = self._structure_signature()
             result = OfflineArchitecture(self.agent, self.config).apply([candidate])
             if not result.get("applied"):
-                trials.append({"candidate": candidate, "applied": False,
-                               "reason": result.get("skipped", []), "gain": float("-inf")})
+                probes.append({"candidate": candidate, "applied": False,
+                               "reason": result.get("skipped", []),
+                               "gradient_norm": 0.0})
                 continue
-            training = self._phase3_train_candidate(train_frames)
-            candidate_F, _ = self._evaluate_current_agent(test_frames)
-            # Measure only newly introduced parameter regions. Existing
-            # overlapping weights do not make a candidate appear influential.
-            grad_norm_sq = 0.0
-            for root_index, module in enumerate(self._unique_modules()):
-                for parameter_name, parameter in module.named_parameters():
-                    gradient = parameter.grad
-                    if gradient is None or not torch.isfinite(gradient).all():
-                        continue
-                    old_shape = baseline_parameter_shapes.get((root_index, parameter_name))
-                    if old_shape is None:
-                        contribution = gradient.detach()
-                    elif tuple(parameter.shape) == old_shape:
-                        continue
-                    else:
-                        mask = torch.ones_like(gradient, dtype=torch.bool)
-                        overlap = tuple(slice(0, min(a, b)) for a, b in zip(old_shape, parameter.shape))
-                        mask[overlap] = False
-                        contribution = gradient.detach()[mask]
-                    if contribution.numel():
-                        grad_norm_sq += float(torch.sum(contribution.float() ** 2).cpu())
-            grad_norm = math.sqrt(grad_norm_sq)
-            policy_loss = training.get("policy_training", {}).get("loss")
-            policy_gain = 0.0
-            if baseline_policy_loss is not None and policy_loss is not None:
-                policy_gain = float(baseline_policy_loss) - float(policy_loss)
-            world_gain = float(baseline_F) - float(candidate_F)
-            combined_gain = world_gain + float(self.config.policy_efe_weight) * policy_gain
-            trials.append({
-                "candidate": candidate, "applied": True,
-                "gain": combined_gain, "world_gain": world_gain,
-                "policy_gain": policy_gain, "policy_loss": policy_loss,
-                "F": float(candidate_F), "gradient_norm": grad_norm,
-                "training": training,
-                "structure_diff": self._structure_diff(before_signature, self._structure_signature()),
-            })
+            probe = self._phase3_probe_candidate(train_frames, baseline_parameter_shapes)
+            probes.append({"candidate": candidate, "applied": True, **probe})
 
         self._restore_agent_trial(baseline_snapshot)
-        gradient_values = [trial.get("gradient_norm", 0.0) for trial in trials
-                           if trial.get("applied") and math.isfinite(trial.get("gradient_norm", 0.0))]
+        gradient_values = [item["gradient_norm"] for item in probes
+                           if item.get("applied") and math.isfinite(item.get("gradient_norm", 0.0))]
         if gradient_values:
             observed_gradient = sum(gradient_values) / len(gradient_values)
             beta = float(self.config.structural_gradient_beta)
@@ -3417,10 +3438,51 @@ class OfflineTrainer(_LegacyOfflineTrainer):
             float(self.config.structural_gradient_min),
             float(self._structural_gradient_ema or 0.0),
         )
-        viable = [trial for trial in trials if trial.get("applied") and
-                  trial.get("gain", 0.0) > self._global_precision() and
-                  trial.get("gradient_norm", 0.0) >= gradient_threshold and
-                  trial.get("gradient_norm", 0.0) > 0.0]
+        promising = [item for item in probes if item.get("applied") and
+                     item.get("gradient_norm", 0.0) >= gradient_threshold and
+                     item.get("gradient_norm", 0.0) > 0.0]
+        promising_ids = {id(item) for item in promising}
+
+        # Second pass: only candidates that passed the gradient pre-filter are
+        # trained. Every trial starts from the same baseline snapshot.
+        trials = []
+        for probe in probes:
+            if not probe.get("applied"):
+                trials.append({**probe, "gain": float("-inf")})
+                continue
+            if id(probe) not in promising_ids:
+                trials.append({"candidate": probe["candidate"], "applied": True,
+                               "trained": False, "gradient_norm": probe["gradient_norm"],
+                               "gain": float("-inf"),
+                               "outcome": "rejected_by_pretraining_gradient_filter"})
+                continue
+            self._restore_agent_trial(baseline_snapshot)
+            before_signature = self._structure_signature()
+            result = OfflineArchitecture(self.agent, self.config).apply([probe["candidate"]])
+            if not result.get("applied"):
+                trials.append({"candidate": probe["candidate"], "applied": False,
+                               "reason": result.get("skipped", []), "gain": float("-inf")})
+                continue
+            training = self._phase3_train_candidate(train_frames)
+            candidate_F, _ = self._evaluate_current_agent(test_frames)
+            policy_loss = training.get("policy_training", {}).get("loss")
+            policy_gain = 0.0
+            if baseline_policy_loss is not None and policy_loss is not None:
+                policy_gain = float(baseline_policy_loss) - float(policy_loss)
+            world_gain = float(baseline_F) - float(candidate_F)
+            combined_gain = world_gain + float(self.config.policy_efe_weight) * policy_gain
+            trials.append({
+                "candidate": probe["candidate"], "applied": True, "trained": True,
+                "gain": combined_gain, "world_gain": world_gain,
+                "policy_gain": policy_gain, "policy_loss": policy_loss,
+                "F": float(candidate_F), "gradient_norm": probe["gradient_norm"],
+                "gradient_threshold": gradient_threshold, "training": training,
+                "structure_diff": self._structure_diff(before_signature, self._structure_signature()),
+            })
+
+        self._restore_agent_trial(baseline_snapshot)
+        viable = [trial for trial in trials if trial.get("trained") and
+                  trial.get("gain", 0.0) > self._global_precision()]
         winner = max(viable, key=lambda item: item["gain"]) if viable else None
         if winner is not None:
             result = OfflineArchitecture(self.agent, self.config).apply([winner["candidate"]])
@@ -3432,28 +3494,21 @@ class OfflineTrainer(_LegacyOfflineTrainer):
                     "candidate": winner["candidate"], "accepted": True,
                     "gain": winner["gain"], "gradient_norm": winner["gradient_norm"],
                     "gradient_threshold": gradient_threshold,
-                    "trials": trials, "training": training, "architecture_result": result,
+                    "trials": trials, "gradient_probes": probes,
+                    "promising_candidate_count": len(promising),
+                    "training": training, "architecture_result": result,
                     "outcome": "best_candidate_committed_restart_learning",
                 }
                 self._structural_log.append(record)
-                # Bound repeated growth within one architectural family. Each
-                # accepted mutation still gets a complete Phase I/II learning
-                # cycle before the next family/candidate is considered.
+                # Keep a diagnostic count only; there is deliberately no fixed
+                # expansion cap. Each accepted mutation gets a complete Phase I/II
+                # learning cycle before the next candidate is considered.
                 level = record["level"]
                 accepted_count = self._phase3_level_expansions.get(level, 0) + 1
                 self._phase3_level_expansions[level] = accepted_count
-                limit = int(self.config.structural_max_expansions_per_level)
                 self._phase3_candidates = []
-                if accepted_count >= limit:
-                    self._advance_phase3_level()
-                    record["level_expansions"] = accepted_count
-                    record["level_expansion_limit"] = limit
-                    record["next_level"] = self._phase3_level
-                    record["outcome"] = "family_expansion_limit_reached_restart_learning"
-                else:
-                    record["level_expansions"] = accepted_count
-                    record["level_expansion_limit"] = limit
-                    record["outcome"] = "best_candidate_committed_restart_learning"
+                record["level_expansions"] = accepted_count
+                record["outcome"] = "best_candidate_committed_restart_learning"
                 self._restart_learning_cycle()
                 self._phase3_stage = "expand"
                 return record
@@ -3461,7 +3516,9 @@ class OfflineTrainer(_LegacyOfflineTrainer):
         previous = self._phase3_level
         self._advance_phase3_level()
         record = {"stage": "expansion", "level": previous, "accepted": False,
-                  "trials": trials, "next_level": self._phase3_level,
+                  "trials": trials, "gradient_probes": probes,
+                  "promising_candidate_count": len(promising),
+                  "next_level": self._phase3_level,
                   "outcome": "family_exhausted_without_improvement"}
         self._structural_log.append(record)
         return record
